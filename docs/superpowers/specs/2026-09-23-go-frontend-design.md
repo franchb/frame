@@ -123,9 +123,18 @@ unrelated `x.Query` match through the `connection` prefix. Therefore:
 5. An unresolved call is never registered, so with exact lookup it cannot match
    any spec. It gets the translator's default unknown-call propagation
    (arguments and receiver taint the result).
+6. Same-file procedures are looked up the same way. `_exec_call` looks specs up
+   by `Call.get_full_name()`, which for a method call is the emitted `s.H`, not
+   the procedure name `Server.H`. So the frontend resolves same-file method and
+   function calls through the type environment and registers the callee's
+   summary spec (see Same-file interprocedural flow) in `library_specs` under
+   exactly the call's `get_full_name()`, with the same abstain-on-conflict rule.
+   The into-callee fixpoint uses the same resolution.
 
 Tests: `x.Repeat(n)` on a non-`bytes`/`strings` receiver and `x.Query(s)` on a
-non-SQL receiver in the same file as a resolved SQL call both produce no sink.
+non-SQL receiver in the same file as a resolved SQL call both produce no sink;
+for a same-file method call `s.H(x)`, `program.get_spec(instr.get_full_name())`
+returns `Server.H`'s summary.
 
 ### LLM coverage (`--ai`)
 
@@ -141,8 +150,13 @@ preserving today's `--ai` coverage. Tuning a Go-aware candidate heuristic is
 deferred until the VLoC measurement shows the cost is worth cutting.
 
 Other `--ai` changes are intended: `collect_sinks(program)` now receives a Go
-`Program`, so the LLM layer gets sink hints and grounding. This is why the
-baseline is captured before merge.
+`Program`, and explored files are translated for cross-file grounding. Grounding
+only promotes a finding to `llm_verified`; ungrounded findings are still added,
+so nothing is dropped. One existing rule now applies to Go: an LLM finding whose
+CWE already has a symbolic finding in the same file is not duplicated (the file
+is still reported). Repository-scale detection (`detect_repo`) has no frontend
+or candidate gate and is unchanged. This is why the baseline is captured before
+merge.
 
 Tests (`tests/test_go_llm_coverage.py`, stub LLM client, no network): a Go file
 with no symbolic finding and no `_CANDIDATE_RE` match still invokes detection
@@ -189,9 +203,10 @@ apart:
 - **Immediate** `f(x)`: an ordinary `Call` in place.
 - **Deferred** `defer f(x)`: arguments are evaluated into fresh temps at the
   `defer` statement. The `Call` on those temps is emitted at every normal exit of
-  the procedure (before each `return`, at fall-off end, and on `panic` paths),
-  in LIFO order of registration. Not on `os.Exit` / `log.Fatal*` paths, which do
-  not run deferred calls in Go.
+  the procedure (at each `return` after its operands are evaluated, at fall-off
+  end, and on `panic` paths), in LIFO order of registration. Not on `os.Exit` /
+  `log.Fatal*` paths, which do not run deferred calls in Go. A `defer` inside a
+  loop is lowered once (one registration, one emitted call per exit).
 - **Asynchronous** `go f(x)`: arguments are evaluated into fresh temps; the
   `Call` is emitted in place (so sinks inside it and taint into its callee are
   seen) but never terminates the caller's path.
@@ -219,6 +234,31 @@ followed by a sink fires; `if bad { os.Exit(1) }` still clears the guarded path.
   spec `taint_propagates`.
 - Conversions (`string(b)`, `[]byte(s)`), composite literals (from their fields)
   and `&x` propagate.
+- The builtins `len` and `cap` return untainted values. Otherwise
+  `make([]byte, len(body))`, present in nearly every Go file that reads a body,
+  becomes a CWE-770 false positive. A twin fixture asserts it.
+
+### Loops and the structural detectors
+
+The shared translator's language-agnostic detectors now run on Go. Per
+detector:
+
+- **CWE-835 (non-terminating loop):** fires only where a frontend sets
+  `loop_body_can_exit = False`. The Go frontend never sets it (leaves `None`),
+  so it cannot fire on Go. `for { conn, _ := l.Accept(); go handle(conn) }`
+  and `for { select { ... } }` worker loops are idiomatic Go, and
+  `loop_exit.py`'s exit set does not cover Go's `panic` / `os.Exit` calls.
+  Fixture: a daemon accept loop stays silent.
+- **CWE-674 (uncontrolled recursion):** left on. Go is outside
+  `_IMPLICIT_RECEIVER_LANGUAGES`, so a method self-call is recognised only when
+  qualified; the detector abstains otherwise. Fixtures: a recursive function
+  with a base case stays silent; one without fires.
+- **Hardcoded-secret literal scan:** left on (it is language-agnostic by
+  design). Fixtures: a credential-shaped `const` fires; an ordinary string
+  constant does not.
+- **Spec-driven structural detectors** (CWE-252, CWE-732, CWE-789): inert,
+  because no Go spec sets `return_must_be_checked`, `permission_mode_arg` or
+  `stack_allocation_size_arg` in this milestone.
 
 ### Go lowering hints (in `go_specs.py`, applied by the frontend)
 
@@ -226,7 +266,7 @@ followed by a sink fires; `if bad { os.Exit(1) }` still clears the guarded path.
 |------|----------|----------|
 | Out-param | `json.Unmarshal(data, &v)`, `(*json.Decoder).Decode(&v)`, `fmt.Sscanf`, gin/echo `c.Bind*` / `ShouldBind*` | extra `Assign v = $ret` |
 | Receiver mutation | `strings.Builder.WriteString`, `bytes.Buffer.Write*`, `url.Values.Set` / `Add` | `Assign recv = recv + arg` |
-| Non-propagating accessor | `r.Context()`, `r.Method`, `r.TLS`, `c.Request.Context()` | result is untainted |
+| Non-propagating accessor | `r.Context()`, `r.Method`, `r.TLS`, `c.Request.Context()`; gin/echo `c.Get`, `c.MustGet`, `c.GetString` (values set server-side by middleware) | result is untainted |
 
 Guard-based sanitization is not a per-call hint; it is the guard-fact analysis
 in Sanitizers.
@@ -252,7 +292,15 @@ Two directions, both needed:
     passes a sanitizer for that kind (an intersection; one unsanitized flow
     empties it). This keeps same-file helpers like
     `func safe(p string) string { return filepath.Base(p) }` from re-tainting
-    their result.
+    their result. The translator's sanitizer handling records per-kind
+    sanitization on the result and still propagates taint, so
+    `exec.Command(safe(x))` keeps firing (a fixture asserts it);
+  - `is_source`: set when a `return` value may come from a source inside the
+    procedure that is not a parameter (for example a handler-shaped function
+    returning a value derived from its own request parameter when called with
+    untainted arguments). The entry `TaintSource`s inserted by the into-callee
+    fixpoint are excluded from this computation, so the fixpoint cannot feed
+    itself.
   - Order: callees before callers; a recursive cycle, or a procedure the
     analysis cannot follow, gets the conservative summary (all parameters and
     the receiver propagate, no sanitizer kinds). Every Go procedure gets an
@@ -275,18 +323,37 @@ milestone-1 set.
 
 ### Sources
 
-- **Typed parameters:** any parameter or receiver declared `*http.Request` /
-  `http.Request`, `*gin.Context` / `gin.Context`, `echo.Context`, `*fiber.Ctx`
-  gets `TaintSource(USER_INPUT)` at procedure entry. Receiver → return
-  propagation then covers `r.FormValue`, `r.URL.Query().Get`, `r.Header.Get`,
-  `r.Body`, `r.URL.Path`, `r.PathValue`, `c.Query`, `c.Param` and the like,
-  subject to the non-propagating accessor table.
-- **Explicit:** `mux.Vars(r)`, `chi.URLParam(r, ...)` (listed for clarity);
-  `os.Args`, `os.Getenv` as `ENV_VAR` (same convention as C `getenv`);
-  `bufio.Reader.ReadString` / `bufio.Scanner.Text` over `os.Stdin` as
-  `USER_INPUT`.
+Milestone 1 roots taint only in server request handlers (plus `library_mode`).
+The measured repositories are full of HTTP *client* code and CLIs, where the
+same types and APIs carry trusted data.
+
+- **Handler-shaped `*http.Request` parameters:** a parameter declared
+  `*http.Request` / `http.Request` gets `TaintSource(USER_INPUT)` at procedure
+  entry only when the procedure is handler-shaped:
+  - its signature also has an `http.ResponseWriter` parameter; or
+  - it is a method named `ServeHTTP`; or
+  - it is a function literal or a same-file function identifier passed as the
+    handler argument of a route registration (`http.HandleFunc`,
+    `(*http.ServeMux).HandleFunc` / `Handle` with `http.HandlerFunc(...)`,
+    gorilla/chi `HandleFunc` / `Get` / `Post` / ..., gin/echo route methods).
+
+  Client-side uses such as `RoundTrip(req *http.Request)` and request builders
+  are not sources. Helpers that receive a tainted request from a handler are
+  still covered by the into-callee fixpoint.
+- **Server context types:** a parameter declared `*gin.Context` /
+  `gin.Context`, `echo.Context` or `*fiber.Ctx` is a source; these types exist
+  only on the server side.
+- Receiver → return propagation then covers `r.FormValue`, `r.URL.Query().Get`,
+  `r.Header.Get`, `r.Body`, `r.URL.Path`, `r.PathValue`, `c.Query`, `c.Param`
+  and the like, subject to the non-propagating accessor table. `mux.Vars(r)` and
+  `chi.URLParam(r, ...)` return taint through their argument.
 - **`library_mode`:** parameters of exported functions typed `string`, `[]byte`
   or `io.Reader` are tainted. Off by default.
+- **Not sources in this milestone:** `os.Args`, `os.Getenv` and `os.Stdin`
+  reads. `_filter_by_confidence` does not discount environment sources, and in
+  operator and CLI repositories they would make `os.Open(os.Args[1])` a CWE-22
+  finding on code whose caller is the trusted operator. Deferred with the CLI
+  threat model.
 
 ### Sinks
 
@@ -337,9 +404,16 @@ Not sanitizers: `filepath.Clean` / `path.Clean` in any other form, including
 for any kind (they leave `169.254.169.254` and `evil.example` intact, so they do
 not constrain a destination).
 
-The `strconv` row needs per-sink-kind sanitization combined with propagation. The
-first implementation task verifies the translator supports that combination and
-adjusts the spec encoding if it does not.
+Translator behaviour this relies on, verified by reading `_exec_call` during
+design review: a sanitizer spec records per-kind sanitization on the result
+(`add_sanitization`) and still propagates taint from argument 0, so a result is
+clean for the listed kinds and tainted for the rest; receiver propagation reads
+the receiver from the emitted `recv.Method` name. The first implementation task
+turns this into tests, adding three points not yet confirmed: (a) the later
+`taint_propagates` step in the same call does not erase the recorded
+sanitization; (b) `ALLOC_SIZE` still fires on an `Atoi` result; (c) a
+`Sanitize` on `p` carries over through `q := p`. If any fails, the spec encoding
+is adjusted before the frontend is built on it.
 
 ### Constant-prefix destinations
 
@@ -372,6 +446,14 @@ complete rule for a kind.
 - **Normalized:** a variable is *normalized* if its reaching definition is the
   result of `filepath.Clean`, `filepath.Abs` or `filepath.Join` (which cleans), or
   the `path` equivalents.
+- **Trusted (untainted) root or allowlist:** lowering runs before taint
+  analysis, so "untainted" is decided syntactically. An expression is trusted
+  if it is a constant, a package-level identifier, a receiver field (`s.root`),
+  or a local whose definitions do not syntactically reference a source-typed
+  parameter, a `library_mode`-tainted parameter, or the variable being checked.
+  Anything else is untrusted and the rule does not apply (recall loss, not
+  precision loss). This definition is used by every "root" and "allowlist"
+  below and by the Join/Clean return-value sanitizer.
 
 Rules (the `Sanitize` is emitted at the first point where the rule holds):
 
@@ -434,7 +516,10 @@ file yields no findings.
 - out-param and receiver-mutation hints;
 - guard facts: accumulation, conjunction, kill on reassignment, join;
 - procedure summaries: propagation, sanitizing helper, constant return,
-  recursion fallback;
+  `is_source`, recursion fallback, lookup by `get_full_name()` for method calls;
+- source shape: handler-shaped `*http.Request` is a source; `RoundTrip(req)` and
+  a request builder are not;
+- `len` / `cap` untainted;
 - `range`, `switch`, `select`; parse-error recovery.
 
 `tests/test_go_taint.py` (end to end through `FrameScanner(language="go")`):
@@ -444,7 +529,10 @@ file yields no findings.
 - every bypass in Sanitizer fixtures;
 - shapes: handler function literal; same-file helper flow in both directions;
   `json.Decode` into a struct; gin and echo handlers; aliased import
-  (`osexec "os/exec"`); `defer os.Exit` before a sink.
+  (`osexec "os/exec"`); `defer os.Exit` before a sink; `make([]byte, len(body))`
+  silent; daemon accept loop silent (CWE-835); recursion with and without a base
+  case (CWE-674); credential-shaped vs ordinary string constant;
+  `os.Open(os.Args[1])` silent.
 
 `tests/test_go_llm_coverage.py`: see LLM coverage.
 
@@ -480,4 +568,5 @@ Also deferred, each needing its own decision: closure capture;
 `template.JS` / `URL` / `CSS` / `HTMLAttr`; sources from Kubernetes API objects,
 CRDs and gRPC messages; `io.ReadAll(r.Body)` and decompression-bomb CWE-400;
 CWE-88 argument injection; a Go-aware LLM candidate heuristic; constant-prefix
-destinations through intermediate variables.
+destinations through intermediate variables; the CLI threat model (`os.Args`,
+`os.Getenv`, stdin as sources).
