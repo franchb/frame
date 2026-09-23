@@ -55,10 +55,11 @@ def _elem_expr(node):
 
 
 class _Frame:
-    __slots__ = ("key", "defs", "params", "receivers")
+    __slots__ = ("key", "defs", "params", "receivers", "node")
 
-    def __init__(self, key, defs, params, receivers):
+    def __init__(self, key, defs, params, receivers, node=None):
         self.key, self.defs, self.params, self.receivers = key, defs, params, receivers
+        self.node = node
 
 
 class TrustOracle:
@@ -79,7 +80,8 @@ class TrustOracle:
         self.field_assign: Dict[str, List] = {}      # "*": a write to any field
         self.escaped_names: Set[str] = set()
         self.escaped_fields: Set[str] = set()
-        self.passed_names: Set[str] = set()          # bare call arguments
+        self.root = root
+        self._reads_only_cache: Dict[Tuple, bool] = {}
         self.frames: List[_Frame] = []
         self._frame_cache: Dict[Tuple[int, int], _Frame] = {}
         self._collect(root)
@@ -109,21 +111,6 @@ class TrustOracle:
             if name in self.env.package_vars:
                 # `v = x`, `v[k] = x` and `v.f = x` all change what v holds.
                 self.pkg_assign.setdefault(name, []).extend((w, fn) for w in written)
-
-    def _record_call_args(self, call) -> None:
-        """A map or slice is a reference: passing it bare to a call lets the
-        callee write into it (`maps.Copy(dst, ...)`), so it escapes like `&x`.
-        Recorded by name; `_trusted_name` applies it to containers only."""
-        if self.key_of(call) in _READ_ONLY_CALLS:
-            return
-        fn = call.child_by_field_name("function")
-        if fn is not None and fn.type == "identifier" and self.text(fn) in ("len", "cap"):
-            return
-        args = call.child_by_field_name("arguments")
-        for a in (args.named_children if args is not None else []):
-            a = _strip(a)
-            if a is not None and a.type == "identifier":
-                self.passed_names.add(self.text(a))
 
     def _record_escape(self, operand) -> None:
         node = _strip(operand)
@@ -212,8 +199,6 @@ class TrustOracle:
                     self._record_escape(n.child_by_field_name("operand"))
             elif n.type == "composite_literal":
                 self._record_positional(n, _enclosing_fn(n))
-            elif n.type == "call_expression":
-                self._record_call_args(n)
             elif n.type == "keyed_element":
                 kids = n.named_children
                 if len(kids) >= 2:
@@ -276,7 +261,7 @@ class TrustOracle:
         """The frame of a function, merged with every enclosing function's (a
         closure sees its outer locals and parameters)."""
         if fn_node is None:
-            return _Frame(None, {}, set(), set())
+            return _Frame(None, {}, set(), set(), None)
         key = (fn_node.start_byte, fn_node.end_byte)
         cached = self._frame_cache.get(key)
         if cached is not None:
@@ -292,14 +277,14 @@ class TrustOracle:
             if node.type == "method_declaration":
                 receivers |= self._param_names(node.child_by_field_name("receiver"))
             node = _enclosing_fn(node)
-        frame = _Frame(key, defs, params, receivers)
+        frame = _Frame(key, defs, params, receivers, fn_node)
         self._frame_cache[key] = frame
         return frame
 
     def enter(self, fn_node, receiver: str, params: Set[str]) -> None:
         base = self._frame_for(fn_node)
         self.frames.append(_Frame(base.key, base.defs, base.params | set(params),
-                                  base.receivers | ({receiver} if receiver else set())))
+                                  base.receivers | ({receiver} if receiver else set()), base.node))
 
     def leave(self) -> None:
         if self.frames:
@@ -375,11 +360,156 @@ class TrustOracle:
                     return True
         return False
 
+    # ---- allowlist containers: a positive list of permitted uses
+    def _reads_only(self, name: str, frame) -> bool:
+        """A map / slice allowlist is trusted only if every occurrence of its
+        name in its scope is a permitted read: its own declaration, an index
+        read, `range`, an argument to a read-only helper or to unshadowed
+        `len` / `cap`, or `delete(m, k)`. Anything else (assignment, alias,
+        other call argument, slicing, `...`, `&`, method call, index write)
+        could let a value the oracle cannot see into it."""
+        local = frame is not None and name in frame.defs
+        if local:
+            scope = frame.node
+            while scope is not None and _enclosing_fn(scope) is not None:
+                scope = _enclosing_fn(scope)       # the outermost enclosing function
+        else:
+            scope = self.root
+        if scope is None:
+            return False
+        key = (scope.start_byte, scope.end_byte, name, local)
+        cached = self._reads_only_cache.get(key)
+        if cached is not None:
+            return cached
+        ok = True
+        stack = [scope]
+        while stack and ok:
+            n = stack.pop()
+            stack.extend(n.named_children)
+            if n.type != "identifier" or self.text(n) != name:
+                continue
+            if not local and self._resolves_locally(n, name):
+                continue                            # a different, shadowing local
+            ok = self._permitted_use(n, name)
+        self._reads_only_cache[key] = ok
+        return ok
+
+    def _declares(self, stmt, name: str) -> bool:
+        """Does statement `stmt` declare `name` in its enclosing block?"""
+        t = stmt.type
+        if t == "short_var_declaration":
+            left = stmt.child_by_field_name("left")
+            return any(c.type == "identifier" and self.text(c) == name
+                       for c in (left.named_children if left is not None else []))
+        if t in ("var_declaration", "const_declaration"):
+            specs = [c for c in stmt.named_children if c.type in ("var_spec", "const_spec")]
+            for group in [c for c in stmt.named_children if c.type in ("var_spec_list", "const_spec_list")]:
+                specs.extend(c for c in group.named_children if c.type in ("var_spec", "const_spec"))
+            return any(self.text(nm) == name for sp in specs for nm in sp.children_by_field_name("name"))
+        if t == "for_clause":
+            return any(self._declares(c, name) for c in stmt.named_children)
+        if t == "range_clause":                      # `for k, v := range x`
+            left = stmt.child_by_field_name("left")
+            declares = any(c.type == ":=" for c in stmt.children)
+            return declares and left is not None and any(
+                self.text(c) == name for c in left.named_children)
+        return False
+
+    def _resolves_locally(self, occ, name: str) -> bool:
+        """Is this occurrence of `name` bound by a local declaration (a
+        parameter, receiver, named result or a declaration in an enclosing
+        block that precedes it) rather than the package-level one?"""
+        decl = occ.parent
+        if decl is not None and decl.type == "expression_list" and decl.parent is not None \
+                and decl == decl.parent.child_by_field_name("left") and (
+                    decl.parent.type == "short_var_declaration"
+                    or (decl.parent.type == "range_clause"
+                        and any(c.type == ":=" for c in decl.parent.children))):
+            return True                             # the declaring occurrence itself
+        if decl is not None and decl.type in ("var_spec", "const_spec") \
+                and _enclosing_fn(decl) is not None:
+            return True
+        child, node = occ, occ.parent
+        while node is not None and node.type != "source_file":
+            if node.type in _FUNC_TYPES:
+                names = set()
+                for field in ("parameters", "receiver", "result"):
+                    names |= self._param_names(node.child_by_field_name(field))
+                if name in names:
+                    return True
+            elif node.type in ("if_statement", "for_statement", "expression_switch_statement",
+                               "type_switch_statement"):
+                for c in node.named_children:
+                    if c.end_byte <= occ.start_byte or c.type in ("for_clause", "range_clause"):
+                        if c.start_byte < child.start_byte and self._declares(c, name):
+                            return True
+                if node.type == "type_switch_statement":
+                    alias = node.child_by_field_name("alias")
+                    if alias is not None and any(self.text(a) == name for a in
+                                                 (alias.named_children or [alias])):
+                        return True
+            else:
+                for c in node.named_children:
+                    if c.end_byte <= occ.start_byte and self._declares(c, name):
+                        return True
+            child, node = node, node.parent
+        return False
+
+    def _builtin(self, fn, names) -> bool:
+        return (fn is not None and fn.type == "identifier" and self.text(fn) in names
+                and self.text(fn) not in self.env.funcs and self.text(fn) not in self.env.package_vars
+                and not self._resolves_locally(fn, self.text(fn)))
+
+    def _permitted_use(self, occ, name: str) -> bool:
+        node, parent = occ, occ.parent
+        while parent is not None and parent.type == "parenthesized_expression":
+            node, parent = parent, parent.parent
+        if parent is None:
+            return False
+        pt = parent.type
+        # its own declaration (the value is judged through its definitions)
+        if pt == "var_spec" and any(n == occ for n in parent.children_by_field_name("name")):
+            return True
+        if pt == "expression_list" and parent.parent is not None \
+                and parent.parent.type == "short_var_declaration" \
+                and parent == parent.parent.child_by_field_name("left"):
+            return True
+        # index read, not written and not addressed
+        if pt == "index_expression" and parent.child_by_field_name("operand") == node:
+            up, above = parent, parent.parent
+            while above is not None and above.type == "parenthesized_expression":
+                up, above = above, above.parent
+            if above is not None and above.type == "expression_list" and above.parent is not None \
+                    and above.parent.type == "assignment_statement" \
+                    and above == above.parent.child_by_field_name("left"):
+                return False
+            if above is not None and above.type in ("inc_statement", "dec_statement"):
+                return False
+            if above is not None and above.type == "unary_expression":
+                op = above.child_by_field_name("operator")
+                if op is not None and self.text(op) == "&":
+                    return False
+            return True
+        if pt == "range_clause" and parent.child_by_field_name("right") == node:
+            return True
+        if pt == "argument_list" and parent.parent is not None \
+                and parent.parent.type == "call_expression":
+            call = parent.parent
+            fn = call.child_by_field_name("function")
+            args = [a for a in parent.named_children if a.type != "comment"]
+            if self.key_of(call) in _READ_ONLY_CALLS:
+                return True
+            if self._builtin(fn, ("len", "cap")):
+                return True
+            if self._builtin(fn, ("delete",)) and args and args[0] == node:
+                return True
+        return False
+
     def _trusted_name(self, name: str, checked, seen) -> bool:
         if name == checked or name in self.escaped_names:
             return False
         frame = self.frames[-1] if self.frames else None
-        if name in self.passed_names and self._is_container(name, frame):
+        if self._is_container(name, frame) and not self._reads_only(name, frame):
             return False
         if self.frames:
             frame = self.frames[-1]

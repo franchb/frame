@@ -652,3 +652,56 @@ def test_redirect_twin_containsrune_backslash():
     # A rune other than backslash does not prove the absence of backslashes.
     partial = body.replace("'\\\\'", "'x'")
     _pair("CWE-601", _handler(partial, RD), _handler(body, RD))
+
+
+# ---- Fix round 3: allowlist containers are trusted only under permitted reads ---------
+HOSTS_GUARD = ('u, err := url.Parse(r.FormValue("u"))\n'
+               'if err != nil || !slices.Contains(HOSTS, u.Hostname()) { return }\nhttp.Get(u.String())')
+HOSTS = 'var HOSTS = []string{"api.example.com"}'
+_ADD = '\nfunc add(w http.ResponseWriter, r *http.Request) { %s }'
+
+
+def test_redirect_bypass_map_written_through_local_alias():
+    extra = ALLOWED + _ADD % 'a := allowed; a[r.FormValue("h")] = true'
+    assert "CWE-601" in _cwes(_handler(MAP_GUARD, RD, extra))
+
+
+def test_redirect_bypass_map_written_through_package_alias():
+    extra = ALLOWED + '\nvar alias = allowed' + _ADD % 'alias[r.FormValue("h")] = true'
+    assert "CWE-601" in _cwes(_handler(MAP_GUARD, RD, extra))
+
+
+def test_ssrf_bypass_slice_filled_through_subslice():
+    extra = HOSTS + '\nfunc fill(xs []string, v string) { xs[0] = v }' + _ADD % 'fill(HOSTS[:], r.FormValue("h"))'
+    assert "CWE-918" in _cwes(_handler(HOSTS_GUARD, RD + '\n"slices"', extra))
+
+
+def test_ssrf_bypass_slice_filled_through_variadic_spread():
+    extra = HOSTS + '\nfunc setT(v string, xs ...string) { xs[0] = v }' + _ADD % 'setT(r.FormValue("h"), HOSTS...)'
+    assert "CWE-918" in _cwes(_handler(HOSTS_GUARD, RD + '\n"slices"', extra))
+
+
+def test_redirect_bypass_shadowed_len_is_not_the_builtin():
+    extra = (ALLOWED + '\nfunc len(m map[string]bool, h string) int { m[h] = true; return 0 }'
+             + _ADD % 'len(allowed, r.FormValue("h"))')
+    assert "CWE-601" in _cwes(_handler(MAP_GUARD, RD, extra))
+
+
+def test_redirect_twin_map_allowlist_with_delete():
+    # delete only removes entries; the firing side adds a tainted one.
+    extra = ALLOWED + _ADD % 'delete(allowed, r.FormValue("h"))'
+    tainted = ALLOWED + _ADD % 'allowed[r.FormValue("h")] = true'
+    _pair("CWE-601", _handler(MAP_GUARD, RD, tainted), _handler(MAP_GUARD, RD, extra))
+
+
+def test_redirect_twin_unrelated_same_named_local_container():
+    # A local `allowed` in another function is a different variable.
+    extra = ALLOWED + '\nfunc other() { allowed := []int{1}; fmt.Println(allowed) }'
+    tainted = ALLOWED + '\nfunc other() { fmt.Println(allowed) }'
+    _pair("CWE-601", _handler(MAP_GUARD, RD + '\n"fmt"', tainted), _handler(MAP_GUARD, RD + '\n"fmt"', extra))
+
+
+def test_redirect_twin_range_and_len_reads_keep_allowlist():
+    extra = ALLOWED + '\nfunc o() int { n := len(allowed); for k := range allowed { _ = k }; return n }'
+    tainted = ALLOWED + '\nfunc o() { a := allowed; _ = a }'
+    _pair("CWE-601", _handler(MAP_GUARD, RD, tainted), _handler(MAP_GUARD, RD, extra))
