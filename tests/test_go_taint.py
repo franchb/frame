@@ -92,6 +92,21 @@ func (rt) RoundTrip(req *http.Request) (*http.Response, error) {
     assert "CWE-78" not in _cwes(src)
 
 
+def test_method_value_handler_does_not_taint_same_named_client_method():
+    base = '''package main
+import ("net/http"; "os/exec")
+type Server struct{}
+type Client struct{}
+func (s *Server) handle(req *http.Request) { %s }
+func (c *Client) handle(req *http.Request) { %s }
+func main() {
+	s := &Server{}
+	http.HandleFunc("/", s.handle)
+}'''
+    sink = "exec.Command(req.URL.Path)"
+    _pair("CWE-78", base % (sink, ""), base % ("", sink))
+
+
 def test_handler_func_literal_fires():
     src = '''package main
 import ("net/http"; "os")

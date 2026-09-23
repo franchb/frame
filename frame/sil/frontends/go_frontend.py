@@ -91,7 +91,8 @@ class GoFrontend:
         self._site_callees: Dict[str, str] = {}
         self._handler_nodes: Set[int] = set()
         self._handler_funcs: Set[str] = set()
-        self._handler_method_names: Set[str] = set()
+        self._handler_methods: Set[Tuple[str, str]] = set()   # (receiver type, method)
+        self._named_results: List[str] = []
         self._proc: Optional[Procedure] = None
         self._node: Optional[Node] = None
         self._last_call_key: Optional[str] = None
@@ -241,11 +242,32 @@ class GoFrontend:
 
     # --------------------------------------------------------- handler shape
     def _collect_handler_registrations(self, root) -> None:
-        """Route registrations name the functions that are request handlers."""
-        stack = [root]
+        """Route registrations name the functions that are request handlers.
+
+        Walked in source order with a light, flow-insensitive scope per function
+        (receiver, parameters, typed `var`s and `x := T{...}`-style locals) so a
+        method value `s.handle` is marked by its receiver's resolved type."""
+        stack = [(root, Scope())]
         while stack:
-            n = stack.pop()
-            stack.extend(n.named_children)
+            n, scope = stack.pop()
+            if n.type in ("function_declaration", "method_declaration", "func_literal"):
+                scope = scope.child()
+                for field in ("receiver", "parameters"):
+                    for pname, ptype in params_of(n.child_by_field_name(field), self._src,
+                                                  self._env.imports):
+                        scope.declare(pname, ptype)
+            elif n.type == "short_var_declaration":
+                self._declare_prepass(scope, n.child_by_field_name("left"),
+                                      n.child_by_field_name("right"))
+            elif n.type == "var_spec":
+                typ = type_of(n.child_by_field_name("type"), self._src, self._env.imports)
+                if typ.known:
+                    for name in n.children_by_field_name("name"):
+                        scope.declare(self._t(name), typ)
+                else:
+                    self._declare_prepass(scope, None, n.child_by_field_name("value"),
+                                          names=n.children_by_field_name("name"))
+            stack.extend((c, scope) for c in reversed(n.named_children))
             if n.type != "call_expression":
                 continue
             fn = n.child_by_field_name("function")
@@ -261,18 +283,37 @@ class GoFrontend:
             if not (by_func or by_method):
                 continue
             for arg in args:
-                self._mark_handler(arg)
+                self._mark_handler(arg, scope)
 
-    def _mark_handler(self, arg) -> None:
+    def _declare_prepass(self, scope: Scope, left, right, names=None) -> None:
+        lefts = list(names) if names is not None else (left.named_children if left is not None else [])
+        rights = right.named_children if right is not None else []
+        saved, self._scope = getattr(self, "_scope", None), scope
+        try:
+            for i, lnode in enumerate(lefts):
+                typ = self._type_of(rights[i]) if len(rights) == len(lefts) else UNKNOWN
+                scope.declare(self._t(lnode), typ)
+        finally:
+            self._scope = saved
+
+    def _mark_handler(self, arg, scope: Scope) -> None:
         if arg.type == "func_literal":
             self._handler_nodes.add(arg.start_byte)
         elif arg.type == "identifier":
             self._handler_funcs.add(self._t(arg))
         elif arg.type == "selector_expression":
-            self._handler_method_names.add(self._t(arg.child_by_field_name("field")))
+            # A method value is a handler only for its resolved receiver type:
+            # an unrelated type's same-named method must not become a source.
+            saved, self._scope = getattr(self, "_scope", None), scope
+            try:
+                recv = self._type_of(arg.child_by_field_name("operand"))
+            finally:
+                self._scope = saved
+            if recv.known:
+                self._handler_methods.add((recv.path, self._t(arg.child_by_field_name("field"))))
         elif arg.type in ("call_expression", "type_conversion_expression"):
             for inner in self._arg_nodes(arg) if arg.type == "call_expression" else arg.named_children:
-                self._mark_handler(inner)
+                self._mark_handler(inner, scope)
 
     def _is_handler_shaped(self, node, receiver, params) -> bool:
         if any(t.path == RESPONSE_WRITER for _, t in params):
@@ -281,7 +322,8 @@ class GoFrontend:
             return node.start_byte in self._handler_nodes
         name = self._t(node.child_by_field_name("name"))
         if node.type == "method_declaration":
-            return name == "ServeHTTP" or name in self._handler_method_names
+            recv_path = receiver[1].path if receiver else ""
+            return name == "ServeHTTP" or (recv_path, name) in self._handler_methods
         return name in self._handler_funcs
 
     # ------------------------------------------------------------- procedures
@@ -329,7 +371,7 @@ class GoFrontend:
         self._program.add_procedure(self._proc)
 
     _STATE = ("_proc", "_node", "_exit", "_scope", "_defers", "_breakables",
-              "_labels", "_gotos", "_last_call_key")
+              "_labels", "_gotos", "_last_call_key", "_named_results")
 
     def _save(self):
         return {k: getattr(self, k, None) for k in self._STATE} | {"facts": self._facts_snapshot()}
@@ -351,6 +393,7 @@ class GoFrontend:
             base = self._t(node.child_by_field_name("name"))
             name = f"go:{receiver[1].path}.{base}" if is_method else f"go:{base}"
         all_params = ([receiver] if receiver else []) + params
+        results = params_of(node.child_by_field_name("result"), self._src, self._env.imports)
         proc = Procedure(
             name=name,
             params=[(PVar(n or f"$p{i}"), Typ.unknown_type()) for i, (n, _) in enumerate(all_params)],
@@ -360,6 +403,14 @@ class GoFrontend:
         self._begin_proc(proc, (outer_scope or Scope()).child())
         for pname, ptype in all_params:
             self._scope.declare(pname, ptype)
+        # Named results are locals: they shadow package consts, and a bare
+        # `return` returns them.
+        named = [(n, t) for n, t in results if n]
+        for rname, rtype in named:
+            self._scope.declare(rname, rtype)
+        self._named_results = [
+            n for i, (n, t) in enumerate(named)
+            if n != "_" and t.path != "error" and not (i == len(named) - 1 and n == "err")]
         self._on_function_start(node, receiver[0] if receiver else "",
                                 {n for n, _ in params if n})
         self._emit_param_sources(node, proc, receiver, params)
@@ -566,6 +617,8 @@ class GoFrontend:
         results = self._proc_results()
         kept = [v for i, v in enumerate(values)
                 if not (i < len(results) and results[i].path == "error")]
+        if not values:                      # bare return: the named results
+            kept = [ExpVar(PVar(n)) for n in (self._named_results or [])]
         for v in kept:
             value = v if value is None else ExpBinOp("+", value, v)
         if value is not None:
@@ -607,7 +660,9 @@ class GoFrontend:
         if init is not None:
             self._lower_stmt(init)
         cond_node = node.child_by_field_name("condition")
-        cond = self._lower_expr(cond_node) if cond_node is not None else ExpConst.boolean(True)
+        # A literal bool Prune is constant-folded for Go: a (broken-parse) missing
+        # condition must stay opaque.
+        cond = self._lower_expr(cond_node) if cond_node is not None else self._opaque(self._loc(node))
         before = self._node
         base = self._facts_snapshot()
         loc = self._loc(node)

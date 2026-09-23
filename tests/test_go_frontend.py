@@ -3,6 +3,7 @@
 from frame.sil.frontends.go_frontend import GoFrontend
 from frame.sil.instructions import Call, TaintSource, Return
 from frame.sil.procedure import NodeKind
+from frame.sil.types import ExpBinOp, ExpConst, ExpVar
 
 
 def _prog(src: str, **kw):
@@ -172,9 +173,81 @@ def test_generic_receiver_method_resolves():
 type Set[T any] struct{ items []T }
 func (s *Set[T]) Add(x T) {}
 func use(s *Set[int]) { s.Add(1) }'''
-    p = _prog(src)
+    fe = GoFrontend()
+    p = fe.translate(src, "t.go")
     assert "go:Set.Add" in p.procedures
-    assert p.procedures["go:use"] is not None
+    adds = [n for n in _names(p.procedures["go:use"]) if n.endswith(".Add")]
+    assert len(adds) == 1 and adds[0].startswith("$r_"), adds
+    assert fe._site_callees[adds[0]] == "go:Set.Add"
+
+
+def _prunes(proc):
+    return [i for n in proc.nodes.values() for i in n.instrs if type(i).__name__ == "Prune"]
+
+
+def test_named_result_shadows_package_const():
+    src = '''package main
+const n = 5
+func f(a string) (n int) {
+	n = len(a)
+	if n > 3 { g() }
+	return
+}'''
+    prunes = _prunes(_prog(src).procedures["go:f"])
+    assert prunes
+    for pr in prunes:
+        assert isinstance(pr.condition, ExpBinOp), pr
+        assert not isinstance(pr.condition.left, ExpConst), pr     # not (5 > 3)
+        assert str(pr.condition.left) == "n"
+
+
+def test_bare_return_returns_named_results_but_not_error():
+    src = '''package main
+import "net/http"
+func get(r *http.Request) (s string, err error) {
+	s = r.FormValue("a")
+	return
+}'''
+    proc = _prog(src).procedures["go:get"]
+    instrs = [i for n in proc.nodes.values() for i in n.instrs]
+    rets = [i for i in instrs if isinstance(i, Return)]
+    assert len(rets) == 1 and isinstance(rets[0].value, ExpVar)
+    ret_assign = next(i for i in instrs if type(i).__name__ == "Assign"
+                      and str(i.id) == str(rets[0].value.var))
+    assert str(ret_assign.exp) == "s"
+
+
+def test_method_value_handler_is_keyed_by_receiver_type():
+    src = '''package main
+import ("net/http"; "os/exec")
+type Server struct{}
+type Client struct{}
+func (s *Server) handle(w2 Writer, req *http.Request) {}
+func (c *Client) handle(req *http.Request) { exec.Command(req.URL.Path) }
+func main() {
+	s := &Server{}
+	http.HandleFunc("/", s.handle)
+}'''
+    p = _prog(src)
+
+    def sources(pname):
+        return [i.var.name for n in p.procedures[pname].nodes.values() for i in n.instrs
+                if isinstance(i, TaintSource)]
+    assert sources("go:Server.handle") == ["req"]
+    assert sources("go:Client.handle") == []
+
+
+def test_method_value_with_unresolved_receiver_marks_nothing():
+    src = '''package main
+import "net/http"
+type Server struct{}
+func (s *Server) handle(req *http.Request) {}
+func main() {
+	http.HandleFunc("/", mk().handle)
+}'''
+    p = _prog(src)
+    assert not any(isinstance(i, TaintSource) for n in p.procedures["go:Server.handle"].nodes.values()
+                   for i in n.instrs)
 
 
 def test_deep_nesting_does_not_crash():
