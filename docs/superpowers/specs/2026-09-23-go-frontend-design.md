@@ -78,8 +78,8 @@ phase (see Phase B).
   import with `GO_FRONTEND_AVAILABLE`, matching the other languages.
 - `frame/sil/procedure.py`: `Program.exact_spec_lookup` flag (see Spec
   resolution). Default `False`; no other language changes behaviour.
-- `frame/sil/translator.py`: `_is_noreturn_call` returns `False` when the
-  program's language is `go` (see Termination). Gated; no other language
+- `frame/sil/translator.py`: a `_is_go_lang` property and the Go-gated edits
+  listed under Translator gates. Every edit is gated; no other language
   changes behaviour.
 - `frame/sil/scanner.py`: `"go"` branch in `_get_frontend` (honours
   `library_mode`, as the JS frontend does); `.go` in both extension maps
@@ -94,7 +94,23 @@ phase (see Phase B).
 - Go stays out of `_is_c_lang`: no C heap detectors run.
 - Go stays out of `_IMPLICIT_RECEIVER_LANGUAGES`: Go methods are always called
   through an explicit receiver.
-- The only translator edit is the Go gate in `_is_noreturn_call`.
+- Every translator edit is gated on `_is_go_lang` (the program's language is
+  `go`); no other language changes behaviour. The edits are:
+  - `_is_noreturn_call` returns `False`: Go termination is structural (see
+    Termination), and C names like `exit`/`err` are ordinary Go identifiers.
+  - Assignment replaces (`_go_assign_rhs` / `_go_settle_assign`): the target
+    takes exactly the right-hand side's taint, and the intersection of its
+    tainted operands' sanitized kinds; an untainted right-hand side clears it.
+  - `_exec_prune` constant-folds a literal boolean `ExpConst` condition, so
+    the dead successor of `if false` / `if true` is skipped.
+  - `_feasibility_guard` pushes polarity down through `&&` / `||`, so a bare
+    call-result inside a combinator gets the sentinel encoding instead of a
+    spuriously UNSAT edge.
+  - `_exec_call` settles a call result's sanitization
+    (`_go_settle_call_sanitization`): the intersection of the sanitized kinds
+    of every tainted input reaching the result (arguments and receiver), plus
+    the call's own sanitizer kinds, so one sanitized argument cannot launder
+    the others; an out-param destination is assigned this result.
 
 ### Spec resolution: frontend resolves, lookup is exact
 
