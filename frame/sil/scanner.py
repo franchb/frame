@@ -424,10 +424,45 @@ def skip_go_file(path: Path, root: Path) -> bool:
         return True
     try:
         with open(path, "rb") as fh:
-            head = fh.read(8192).decode("utf-8", errors="replace")
+            head = fh.read(8192)
     except OSError:
         return False
-    return _GO_GENERATED_HEADER.search(head) is not None
+    # utf-8-sig strips a leading BOM so it never shifts line 1 into the marker
+    # search.
+    text = head.decode("utf-8-sig", errors="replace")
+    # Go's convention: the generated-code marker is only meaningful in the
+    # leading comment block, before the first non-comment, non-blank line
+    # (conventionally `package ...`). Searching the whole file would also
+    # match the same text sitting in a string literal or a later comment,
+    # which is real source -- e.g. a generator's own code that prints the
+    # marker -- not a generator's output. `/* ... */` block comments (the
+    # common license-header shape, e.g. Kubernetes generated files) are part
+    # of that leading run too and must be skipped over, not treated as the
+    # end of it.
+    leading_comments = []
+    in_block = False
+    for line in text.splitlines():
+        if in_block:
+            end = line.find("*/")
+            if end == -1:
+                continue
+            in_block = False
+            line = line[end + 2:]
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("//"):
+            leading_comments.append(line)
+            continue
+        if stripped.startswith("/*"):
+            end = stripped.find("*/", 2)
+            if end == -1:
+                in_block = True
+                continue
+            # Single-line block comment; keep scanning the rest of the file.
+            continue
+        break
+    return _GO_GENERATED_HEADER.search("\n".join(leading_comments)) is not None
 
 
 class FrameScanner:
@@ -1098,7 +1133,7 @@ class FrameScanner:
         try:
             for filepath in dir_path.glob(pattern):
                 if filepath.is_file():
-                    if filepath.suffix == ".go" and skip_go_file(filepath, dir_path):
+                    if filepath.suffix.lower() == ".go" and skip_go_file(filepath, dir_path):
                         continue
                     result = self.scan_file(str(filepath))
                     results.append(result)
