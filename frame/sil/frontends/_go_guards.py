@@ -32,34 +32,101 @@ def _strip(node):
 
 
 # --------------------------------------------------------------------------- trust
+_FUNC_TYPES = ("function_declaration", "method_declaration", "func_literal")
+_TRUSTED_LITERAL_TYPES = ("slice_type", "array_type", "implicit_length_array_type", "map_type")
+
+
+def _enclosing_fn(node):
+    node = node.parent if node is not None else None
+    while node is not None and node.type not in _FUNC_TYPES:
+        node = node.parent
+    return node
+
+
+def _elem_expr(node):
+    """The expression inside a literal_element (or the node itself)."""
+    if node is not None and node.type == "literal_element" and node.named_children:
+        return node.named_children[0]
+    return node
+
+
+class _Frame:
+    __slots__ = ("key", "defs", "params", "receivers")
+
+    def __init__(self, key, defs, params, receivers):
+        self.key, self.defs, self.params, self.receivers = key, defs, params, receivers
+
+
 class TrustOracle:
     """Decides syntactically whether a root / allowlist expression is trusted,
-    from in-file reaching definitions (spec: "Trusted (untainted) root")."""
+    from in-file reaching definitions (spec: "Trusted (untainted) root").
+
+    Every collected write remembers the function it occurs in and is judged in
+    that function's frame. Writes the oracle cannot see make the target
+    untrusted: an address taken with `&` (an out-parameter) and a positional
+    struct literal (a write to every field)."""
 
     def __init__(self, root, src: bytes, env: FileEnv,
                  key_of: Callable, is_alias: Callable, text: Callable):
         self.src, self.env = src, env
         self.key_of, self.is_alias, self.text = key_of, is_alias, text
+        # name -> [(rhs node | None | "zero", enclosing function node | None)]
         self.pkg_assign: Dict[str, List] = {}
-        self.field_assign: Dict[str, List] = {}
-        self.frames: List[Tuple[Dict[str, List], Set[str], str]] = []
+        self.field_assign: Dict[str, List] = {}      # "*": a write to any field
+        self.escaped_names: Set[str] = set()
+        self.escaped_fields: Set[str] = set()
+        self.frames: List[_Frame] = []
+        self._frame_cache: Dict[Tuple[int, int], _Frame] = {}
         self._collect(root)
 
-    def _record_target(self, lnode, rnode) -> None:
+    # ---- collection
+    def _record_target(self, lnode, rnode, fn) -> None:
         lnode = _strip(lnode)
         if lnode is None:
             return
-        if lnode.type == "identifier":
-            name = self.text(lnode)
+        node = lnode
+        while node is not None and node.type in ("selector_expression", "index_expression",
+                                                 "parenthesized_expression", "unary_expression"):
+            if node.type == "selector_expression":
+                self.field_assign.setdefault(
+                    self.text(node.child_by_field_name("field")), []).append((rnode, fn))
+            node = (node.child_by_field_name("operand") if node.type != "parenthesized_expression"
+                    else (node.named_children[0] if node.named_children else None))
+        if node is not None and node.type == "identifier":
+            name = self.text(node)
             if name in self.env.package_vars:
-                self.pkg_assign.setdefault(name, []).append(rnode)
-        elif lnode.type in ("selector_expression", "index_expression"):
-            node = lnode
-            while node is not None and node.type in ("selector_expression", "index_expression"):
-                if node.type == "selector_expression":
-                    self.field_assign.setdefault(
-                        self.text(node.child_by_field_name("field")), []).append(rnode)
-                node = node.child_by_field_name("operand")
+                # `v = x`, `v[k] = x` and `v.f = x` all change what v holds.
+                self.pkg_assign.setdefault(name, []).append((rnode, fn))
+
+    def _record_escape(self, operand) -> None:
+        node = _strip(operand)
+        if node is None or node.type == "composite_literal":
+            return
+        while node is not None and node.type in ("selector_expression", "index_expression",
+                                                 "parenthesized_expression"):
+            if node.type == "selector_expression":
+                self.escaped_fields.add(self.text(node.child_by_field_name("field")))
+            node = (node.child_by_field_name("operand") if node.type != "parenthesized_expression"
+                    else (node.named_children[0] if node.named_children else None))
+        if node is not None and node.type == "identifier":
+            self.escaped_names.add(self.text(node))
+
+    def _record_positional(self, lit, fn) -> None:
+        type_node = lit.child_by_field_name("type")
+        body = lit.child_by_field_name("body")
+        if type_node is None or body is None or type_node.type in _TRUSTED_LITERAL_TYPES:
+            return
+        elems = [_elem_expr(e) for e in body.named_children
+                 if e.type not in ("keyed_element", "comment")]
+        if not elems:
+            return
+        if type_node.type == "type_identifier" and self.text(type_node) not in self.env.struct_fields:
+            return                                  # a local non-struct type
+        fields = (list(self.env.struct_fields[self.text(type_node)])
+                  if type_node.type == "type_identifier" else ["*"])
+        for f in fields:
+            for e in elems:
+                self.field_assign.setdefault(f, []).append((e, fn))
 
     def _collect(self, root) -> None:
         stack = [root]
@@ -71,26 +138,39 @@ class TrustOracle:
                 rights = n.child_by_field_name("right")
                 ls = lefts.named_children if lefts is not None else []
                 rs = rights.named_children if rights is not None else []
+                fn = _enclosing_fn(n)
                 for i, l in enumerate(ls):
-                    self._record_target(l, rs[i] if len(rs) == len(ls) else None)
+                    self._record_target(l, rs[i] if len(rs) == len(ls) else None, fn)
+            elif n.type == "unary_expression":
+                op = n.child_by_field_name("operator")
+                if op is not None and self.text(op) == "&":
+                    self._record_escape(n.child_by_field_name("operand"))
+            elif n.type == "composite_literal":
+                self._record_positional(n, _enclosing_fn(n))
             elif n.type == "keyed_element":
                 kids = n.named_children
                 if len(kids) >= 2:
-                    key = _strip(kids[0].named_children[0] if kids[0].type == "literal_element"
-                                 and kids[0].named_children else kids[0])
+                    key = _strip(_elem_expr(kids[0]))
                     if key is not None and key.type in ("identifier", "field_identifier"):
-                        value = kids[-1].named_children[0] if kids[-1].type == "literal_element" \
-                            and kids[-1].named_children else kids[-1]
-                        self.field_assign.setdefault(self.text(key), []).append(value)
+                        self.field_assign.setdefault(self.text(key), []).append(
+                            (_elem_expr(kids[-1]), _enclosing_fn(n)))
             elif n.type == "var_spec" and n.parent is not None and n.parent.type == "var_declaration" \
                     and n.parent.parent is not None and n.parent.parent.type == "source_file":
                 values = n.child_by_field_name("value")
                 vals = values.named_children if values is not None else []
                 for i, name in enumerate(n.children_by_field_name("name")):
                     self.pkg_assign.setdefault(self.text(name), []).append(
-                        vals[i] if i < len(vals) else "zero")
+                        (vals[i] if i < len(vals) else "zero", None))
 
-    def enter(self, fn_node, receiver: str, params: Set[str]) -> None:
+    # ---- frames
+    def _param_names(self, plist) -> Set[str]:
+        out: Set[str] = set()
+        for p in (plist.named_children if plist is not None else []):
+            for name in p.children_by_field_name("name"):
+                out.add(self.text(name))
+        return out
+
+    def _own_defs(self, fn_node) -> Dict[str, List]:
         defs: Dict[str, List] = {}
         body = fn_node.child_by_field_name("body")
         stack = [body] if body is not None else []
@@ -103,9 +183,13 @@ class TrustOracle:
                 ls = lefts.named_children if lefts is not None else []
                 rs = rights.named_children if rights is not None else []
                 for i, l in enumerate(ls):
-                    if l.type == "identifier":
-                        defs.setdefault(self.text(l), []).append(
-                            rs[i] if len(rs) == len(ls) else None)
+                    rhs = rs[i] if len(rs) == len(ls) else None
+                    base = _strip(l)
+                    while base is not None and base.type in ("selector_expression", "index_expression",
+                                                             "unary_expression"):
+                        base = _strip(base.child_by_field_name("operand"))
+                    if base is not None and base.type == "identifier":
+                        defs.setdefault(self.text(base), []).append(rhs)
             elif n.type in ("var_spec", "const_spec"):
                 values = n.child_by_field_name("value")
                 vals = values.named_children if values is not None else []
@@ -115,19 +199,50 @@ class TrustOracle:
                 left = n.child_by_field_name("left")
                 for l in (left.named_children if left is not None else []):
                     defs.setdefault(self.text(l), []).append(None)
-        self.frames.append((defs, set(params), receiver))
+        return defs
+
+    def _frame_for(self, fn_node) -> _Frame:
+        """The frame of a function, merged with every enclosing function's (a
+        closure sees its outer locals and parameters)."""
+        if fn_node is None:
+            return _Frame(None, {}, set(), set())
+        key = (fn_node.start_byte, fn_node.end_byte)
+        cached = self._frame_cache.get(key)
+        if cached is not None:
+            return cached
+        defs: Dict[str, List] = {}
+        params: Set[str] = set()
+        receivers: Set[str] = set()
+        node = fn_node
+        while node is not None:
+            for name, rhs in self._own_defs(node).items():
+                defs.setdefault(name, []).extend(rhs)
+            params |= self._param_names(node.child_by_field_name("parameters"))
+            if node.type == "method_declaration":
+                receivers |= self._param_names(node.child_by_field_name("receiver"))
+            node = _enclosing_fn(node)
+        frame = _Frame(key, defs, params, receivers)
+        self._frame_cache[key] = frame
+        return frame
+
+    def enter(self, fn_node, receiver: str, params: Set[str]) -> None:
+        base = self._frame_for(fn_node)
+        self.frames.append(_Frame(base.key, base.defs, base.params | set(params),
+                                  base.receivers | ({receiver} if receiver else set())))
 
     def leave(self) -> None:
         if self.frames:
             self.frames.pop()
 
+    # ---- queries
     def trusted(self, node, checked: Optional[str] = None, _seen: Optional[Set] = None) -> bool:
         node = _strip(node)
         if node is None:
             return False
         seen = _seen if _seen is not None else set()
         t = node.type
-        if t in ("interpreted_string_literal", "raw_string_literal", "int_literal", "rune_literal"):
+        if t in ("interpreted_string_literal", "raw_string_literal", "int_literal", "rune_literal",
+                 "true", "false"):
             return True
         if t == "binary_expression":
             return (self.trusted(node.child_by_field_name("left"), checked, seen)
@@ -136,6 +251,10 @@ class TrustOracle:
             return self._trusted_name(self.text(node), checked, seen)
         if t == "selector_expression":
             return self._trusted_field_path(node, checked, seen)
+        if t == "composite_literal":
+            type_node = node.child_by_field_name("type")
+            return (type_node is not None and type_node.type in _TRUSTED_LITERAL_TYPES
+                    and self._trusted_elements(node.child_by_field_name("body"), checked, seen))
         if t == "call_expression":
             fn = node.child_by_field_name("function")
             args_node = node.child_by_field_name("arguments")
@@ -147,15 +266,33 @@ class TrustOracle:
             return key in TRUSTED_PURE_CALLS and all(self.trusted(a, checked, seen) for a in args)
         return False
 
+    def _trusted_elements(self, body, checked, seen) -> bool:
+        """Every key and value of a slice / array / map literal is trusted."""
+        if body is None:
+            return False
+        for e in body.named_children:
+            if e.type == "comment":
+                continue
+            parts = e.named_children if e.type == "keyed_element" else [e]
+            for part in parts:
+                inner = _elem_expr(part)
+                if inner is not None and inner.type == "literal_value":
+                    if not self._trusted_elements(inner, checked, seen):
+                        return False
+                elif not self.trusted(inner, checked, seen):
+                    return False
+        return True
+
     def _trusted_name(self, name: str, checked, seen) -> bool:
-        if name == checked:
+        if name == checked or name in self.escaped_names:
             return False
         if self.frames:
-            defs, params, receiver = self.frames[-1]
-            if name in params or name == receiver:
+            frame = self.frames[-1]
+            if name in frame.params or name in frame.receivers:
                 return False
-            if name in defs:
-                return self._all_trusted(("local", name), defs[name], checked, seen)
+            if name in frame.defs:
+                return self._all_trusted(("local", frame.key, name),
+                                         [(r, frame) for r in frame.defs[name]], checked, seen)
         if name in self.env.consts:
             return True
         if name in self.env.package_vars:
@@ -175,31 +312,48 @@ class TrustOracle:
         if base is None or base.type != "identifier":
             return False
         base_name = self.text(base)
-        if base_name == checked:
+        if base_name == checked or base_name in self.escaped_names:
             return False
-        receiver = self.frames[-1][2] if self.frames else ""
-        base_ok = base_name == receiver or (
+        if any(f in self.escaped_fields for f in fields):
+            return False
+        frame = self.frames[-1] if self.frames else None
+        base_ok = (frame is not None and base_name in frame.receivers) or (
             base_name in self.env.package_vars and self._trusted_name(base_name, checked, seen)) or (
-            bool(self.frames) and base_name in self.frames[-1][0]
+            frame is not None and base_name in frame.defs
             and self._trusted_name(base_name, checked, seen))
         if not base_ok:
             return False
-        return all(self._all_trusted(("field", f), self.field_assign.get(f, []), checked, seen)
+        writes = self.field_assign.get("*", [])
+        return all(self._all_trusted(("field", f), self.field_assign.get(f, []) + writes, checked, seen)
                    for f in fields)
 
-    def _all_trusted(self, key, rhs_nodes, checked, seen) -> bool:
+    def _all_trusted(self, key, entries, checked, seen) -> bool:
+        """entries: (rhs, where) with `where` a _Frame (same frame), a function
+        node (judged in that function's frame) or None (package level)."""
         if key in seen:
             return False
         seen = seen | {key}
-        for rhs in rhs_nodes:
+        for rhs, where in entries:
             if rhs == "zero":
                 continue
-            if rhs is None or not self.trusted(rhs, checked, seen):
+            if rhs is None:
+                return False
+            frame = where if isinstance(where, _Frame) else self._frame_for(where)
+            self.frames.append(frame)
+            try:
+                ok = self.trusted(rhs, checked, seen)
+            finally:
+                self.frames.pop()
+            if not ok:
                 return False
         return True
 
 
 # --------------------------------------------------------------------------- guards
+class _GuardCounter:
+    n = 0          # unique Rel-call instance ids (never reset: ids only need to differ)
+
+
 class GuardTracker:
     def __init__(self, src: bytes, trust: TrustOracle, key_of: Callable,
                  arg_nodes: Callable, const_str: Callable, text: Callable):
@@ -214,8 +368,11 @@ class GuardTracker:
         self.normalized: FrozenSet[str] = frozenset()
         self.url_src: Dict[str, str] = {}
         self.url_err: Dict[str, str] = {}
-        self.rel_src: Dict[str, Tuple[Optional[str], str]] = {}
-        self.rel_err: Dict[str, str] = {}
+        # A filepath.Rel call instance: rel var -> (trusted root text | None, p, id);
+        # err var -> (p, id). Rel literals carry the instance id, so the err,
+        # `..` and root parts of the rule must all come from one call.
+        self.rel_src: Dict[str, Tuple[Optional[str], str, str]] = {}
+        self.rel_err: Dict[str, Tuple[str, str]] = {}
 
     def snapshot(self):
         return (self.clauses, dict(self.emitted), self.normalized, dict(self.url_src),
@@ -255,10 +412,12 @@ class GuardTracker:
         self.clauses = frozenset(c for c in self.clauses if all(l[0] != var for l in c))
         self.emitted.pop(var, None)
         self.normalized = self.normalized - {var}
-        for m in (self.url_src, self.url_err, self.rel_err):
+        for m in (self.url_src, self.url_err):
             for k in [k for k, v in m.items() if k == var or v == var]:
                 del m[k]
-        for k in [k for k, (_, p) in self.rel_src.items() if k == var or p == var]:
+        for k in [k for k, (p, _) in self.rel_err.items() if k == var or p == var]:
+            del self.rel_err[k]
+        for k in [k for k, (_, p, _) in self.rel_src.items() if k == var or p == var]:
             del self.rel_src[k]
 
     # ---- assignments
@@ -287,10 +446,12 @@ class GuardTracker:
         if key == "path/filepath.Rel" and len(args) == 2 and _strip(args[1]).type == "identifier":
             p = self.text(_strip(args[1]))
             root = self.text(args[0]) if self.trust.trusted(args[0], checked=p) else None
+            _GuardCounter.n += 1
+            inst = f"rel#{_GuardCounter.n}"
             if first != "_":
-                self.rel_src[first] = (root, p)
+                self.rel_src[first] = (root, p, inst)
             if err != "_":
-                self.rel_err[err] = p
+                self.rel_err[err] = (p, inst)
 
     # ---- conditions
     def on_branch(self, cond_node, truth: bool) -> Dict[str, Set[str]]:
@@ -387,7 +548,10 @@ class GuardTracker:
             atoms = []
             if key == "strings.Contains" and needle == "..":
                 atoms.append("has_dotdot")
-            if "\\" in needle:
+            # Contains / ContainsRune test for the whole needle: only a lone
+            # backslash proves there is no backslash anywhere. ContainsAny
+            # tests each character of the set.
+            if (needle == "\\") if key != "strings.ContainsAny" else ("\\" in needle):
                 atoms.append("has_bs")
             if key == "strings.ContainsAny" and {"\t", "\n", "\r"} <= set(needle):
                 atoms.append("has_ctrl")
@@ -408,14 +572,14 @@ class GuardTracker:
     def _prefix_atom(self, v: str, prefix_node, truth: bool) -> List[Clause]:
         const = self.const_str(prefix_node)
         if v in self.rel_src:                       # HasPrefix(rel, "..") / (rel, ".."+sep)
-            p = self.rel_src[v][1]
+            _, p, inst = self.rel_src[v]
             if const == "..":
-                return self._clauses([p], "rel_prefix", "..", truth)
+                return self._clauses([p], "rel_prefix", inst + "|..", truth)
             node = _strip(prefix_node)
             if node is not None and node.type == "binary_expression" and self._op(node) == "+" \
                     and self.const_str(node.child_by_field_name("left")) == ".." \
                     and self.text(node.child_by_field_name("right")) in _SEPARATOR_TEXTS:
-                return self._clauses([p], "rel_prefix", "..sep", truth)
+                return self._clauses([p], "rel_prefix", inst + "|..sep", truth)
             return [_UNKNOWN]
         if const in ("/", "//", "/\\"):
             return self._clauses([v], "prefix", const, truth)
@@ -437,7 +601,8 @@ class GuardTracker:
                 if av in self.url_err:
                     return self._clauses([self.url_err[av]], "url_err", "", not equal)
                 if av in self.rel_err:
-                    return self._clauses([self.rel_err[av]], "rel_err", "", not equal)
+                    p, inst = self.rel_err[av]
+                    return self._clauses([p], "rel_err", inst, not equal)
             host_u = self._host_var(a)
             if host_u:
                 c = self.const_str(b)
@@ -446,7 +611,8 @@ class GuardTracker:
                 if c and self.trust.trusted(b):
                     return self._clauses(self._url_vars(host_u), "host_allowed", "", equal)
             if av in self.rel_src and self.const_str(b) == "..":
-                return self._clauses([self.rel_src[av][1]], "rel_eq_dotdot", "", equal)
+                _, p, inst = self.rel_src[av]
+                return self._clauses([p], "rel_eq_dotdot", inst, equal)
             if av and b is not None and self.trust.trusted(b, checked=av):
                 return self._clauses([av], "eq_root", self.text(b), equal)
         return [_UNKNOWN]
@@ -460,11 +626,12 @@ class GuardTracker:
                      if l[0] == v and l[1] in ("eq_root", "prefix_sep") and l[3]}
             if any(imp((v, "eq_root", r, True), (v, "prefix_sep", r, True)) for r in roots):
                 kinds.add(FS)
-            rel_ok = any(p == v and root is not None for (root, p) in self.rel_src.values())
-            if rel_ok and imp((v, "rel_err", "", False)) and (
-                    imp((v, "rel_prefix", "..", False))
-                    or (imp((v, "rel_prefix", "..sep", False)) and imp((v, "rel_eq_dotdot", "", False)))):
-                kinds.add(FS)
+            for root, p, inst in self.rel_src.values():
+                if p == v and root is not None and imp((v, "rel_err", inst, False)) and (
+                        imp((v, "rel_prefix", inst + "|..", False))
+                        or (imp((v, "rel_prefix", inst + "|..sep", False))
+                            and imp((v, "rel_eq_dotdot", inst, False)))):
+                    kinds.add(FS)
         if imp((v, "is_local", "", True)):
             kinds.add(FS)
         no_bs = imp((v, "has_bs", "", False))

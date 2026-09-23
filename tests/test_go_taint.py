@@ -475,3 +475,115 @@ def test_alloc_twin_bounded():
     imports = '"net/http"\n"strconv"'
     _pair("CWE-770", _handler(body.replace('if n > 1048576 { return }\n', ''), imports),
           _handler(body, imports))
+
+
+# ---- Fix round 1: over-permissive sanitizers (bypasses must fire) -----------------
+def test_redirect_bypass_double_backslash_needle():
+    body = ('next := r.FormValue("next")\n'
+            'if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || '
+            'strings.Contains(next, "\\\\\\\\") || strings.ContainsAny(next, "\\r\\n\\t") { return }\n'
+            'http.Redirect(w, r, next, 302)')
+    assert "CWE-601" in _cwes(_handler(body, RD))
+
+
+def test_redirect_bypass_slash_backslash_needle():
+    body = ('next := r.FormValue("next")\n'
+            'if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || '
+            'strings.Contains(next, "/\\\\") || strings.ContainsAny(next, "\\r\\n\\t") { return }\n'
+            'http.Redirect(w, r, next, 302)')
+    assert "CWE-601" in _cwes(_handler(body, RD))
+
+
+def test_fs_bypass_root_decoded_into_local_struct():
+    body = ('var c Cfg\njson.NewDecoder(r.Body).Decode(&c)\n'
+            'os.ReadFile(filepath.Join(c.Root, filepath.Clean("/" + r.FormValue("f"))))')
+    assert "CWE-22" in _cwes(_handler(body, FS + '\n"encoding/json"', 'type Cfg struct{ Root string }'))
+
+
+def test_fs_bypass_root_decoded_into_package_var():
+    body = ('json.NewDecoder(r.Body).Decode(&cfg)\n'
+            'os.ReadFile(filepath.Join(cfg.Root, filepath.Clean("/" + r.FormValue("f"))))')
+    extra = 'type Cfg struct{ Root string }\nvar cfg Cfg'
+    assert "CWE-22" in _cwes(_handler(body, FS + '\n"encoding/json"', extra))
+
+
+def test_fs_bypass_field_written_from_other_functions_parameter():
+    # `root` in New is New's parameter, not Serve's trusted local of that name.
+    extra = ('type S struct{ root string }\n'
+             'func New(root string) *S { return &S{root: root} }\n'
+             'func (s *S) Serve(w http.ResponseWriter, r *http.Request) {\n'
+             '  root := "/srv"\n  _ = root\n'
+             '  os.ReadFile(filepath.Join(s.root, filepath.Clean("/" + r.FormValue("f"))))\n}')
+    assert "CWE-22" in _cwes(_handler("", FS, extra))
+
+
+def test_fs_bypass_positional_struct_literal_writes_root():
+    extra = ('type S struct{ root string }\n'
+             'func (s *S) Serve(w http.ResponseWriter, r *http.Request) {\n'
+             '  os.ReadFile(filepath.Join(s.root, filepath.Clean("/" + r.FormValue("f"))))\n}\n'
+             'func mk(w http.ResponseWriter, r *http.Request) { t := &S{r.FormValue("root")}; t.Serve(w, r) }')
+    assert "CWE-22" in _cwes(_handler("", FS, extra))
+
+
+def test_fs_bypass_rel_parts_from_different_rel_calls():
+    body = ('p := filepath.Join(root, r.FormValue("f"))\n'
+            'rel, err := filepath.Rel(root, p)\n_ = rel\n'
+            'rel2, _ := filepath.Rel("/", p)\n'
+            'if err != nil || strings.HasPrefix(rel2, "..") { return }\n'
+            'os.ReadFile(p)')
+    assert "CWE-22" in _cwes(_handler(body, FS, 'const root = "/srv/www"'))
+
+
+# ---- Fix round 1: allowlist containers and missing twins ----------------------------
+def test_redirect_twin_map_allowlist():
+    guard = 'if err != nil || !allowed[u.Hostname()] { return }\n'
+    body = ('u, err := url.Parse(r.FormValue("next"))\n' + guard +
+            'http.Redirect(w, r, u.String(), 302)')
+    extra = 'var allowed = map[string]bool{"example.com": true}'
+    _pair("CWE-601", _handler(body.replace(guard, '_ = err\n_ = allowed\n'), RD, extra),
+          _handler(body, RD, extra))
+
+
+def test_ssrf_twin_slice_allowlist():
+    body = ('u, err := url.Parse(r.FormValue("u"))\n'
+            'if err != nil || !slices.Contains(HOSTS, u.Hostname()) { return }\n'
+            'http.Get(u.String())')
+    imports = RD + '\n"slices"'
+    trusted = body.replace("HOSTS", '[]string{"api.example.com", "cdn.example.com"}')
+    tainted = body.replace("HOSTS", '[]string{"api.example.com", r.FormValue("extra")}')
+    _pair("CWE-918", _handler(tainted, imports), _handler(trusted, imports))
+
+
+def test_fs_twin_equal_or_separator_prefix():
+    guard = 'if !(p == root || strings.HasPrefix(p, root+string(filepath.Separator))) { return }\n'
+    body = 'p := filepath.Clean(filepath.Join(root, r.FormValue("f")))\n' + guard + 'os.ReadFile(p)'
+    extra = 'const root = "/srv/www"'
+    _pair("CWE-22", _handler(body.replace(guard, ''), FS, extra), _handler(body, FS, extra))
+
+
+def test_fs_twin_equal_or_slash_prefix():
+    guard = 'if p != root && !strings.HasPrefix(p, root+"/") { return }\n'
+    body = 'p := filepath.Clean(filepath.Join(root, r.FormValue("f")))\n' + guard + 'os.ReadFile(p)'
+    extra = 'const root = "/srv/www"'
+    _pair("CWE-22", _handler(body.replace(guard, ''), FS, extra), _handler(body, FS, extra))
+
+
+def test_fs_twin_rel_dotdot_equal_or_dotdot_separator():
+    check = ('if err != nil || rel == ".." || '
+             'strings.HasPrefix(rel, ".."+string(filepath.Separator)) { return }\n')
+    body = ('p := filepath.Join(root, r.FormValue("f"))\n'
+            'rel, err := filepath.Rel(root, p)\n' + check + 'os.ReadFile(p)')
+    # Without the `rel == ".."` part the rule is incomplete and must fire.
+    partial = body.replace('rel == ".." || ', '')
+    extra = 'const root = "/srv/www"'
+    _pair("CWE-22", _handler(partial, FS, extra), _handler(body, FS, extra))
+
+
+def test_redirect_twin_relative_path_with_url_parse_error_for_control_chars():
+    body = ('next := r.FormValue("next")\n_, err := url.Parse(next)\n'
+            'if err != nil || !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || '
+            'strings.Contains(next, "\\\\") { return }\n'
+            'http.Redirect(w, r, next, 302)')
+    # Without the url.Parse error rejection the control-character part is missing.
+    partial = body.replace('err != nil || ', '').replace('_, err := url.Parse(next)\n', '')
+    _pair("CWE-601", _handler(partial, RD), _handler(body, RD))
