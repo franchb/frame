@@ -47,6 +47,7 @@ dependencies = [
 scan = [
     "tree-sitter>=0.21.0",
     "tree-sitter-python>=0.21.0",
+    "tree-sitter-go>=0.25.0",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -57,6 +58,7 @@ dev = [
 all = [
     "tree-sitter>=0.21.0",
     "tree-sitter-python>=0.21.0",
+    "tree-sitter-go>=0.25.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "requests>=2.25.0",
