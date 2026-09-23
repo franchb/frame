@@ -850,6 +850,7 @@ class FrameScanner:
             result.scan_time_ms = (time.time() - start_time) * 1000
             return result
 
+        program = None
         try:
             # Step 1: Parse source to SIL
             if self.verbose:
@@ -940,6 +941,13 @@ class FrameScanner:
             if self.verbose:
                 import traceback
                 traceback.print_exc()
+            # Go: a file that crashes the symbolic layer (e.g. a very long `+`
+            # chain hitting __str__ recursion) keeps the --ai detection pass it
+            # had before the frontend existed. Gated so other languages keep
+            # their current behaviour.
+            if self.llm_detect and self.language == "go":
+                result.vulnerabilities = self._apply_llm_detect(
+                    result.vulnerabilities, source_code, filename, program)
 
         result.scan_time_ms = (time.time() - start_time) * 1000
 

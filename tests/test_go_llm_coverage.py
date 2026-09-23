@@ -47,3 +47,34 @@ def test_go_file_with_symbolic_finding_reaches_llm(monkeypatch):
 def test_other_languages_keep_the_candidate_gate(monkeypatch):
     calls, _ = _run(monkeypatch, "python", "def f(x):\n    return x\n", "f.py")
     assert calls == []
+
+
+def _boom(*a, **k):
+    raise RuntimeError("translator blew up")
+
+
+def test_go_symbolic_crash_still_reaches_llm(monkeypatch):
+    # A file that crashes the symbolic layer (e.g. a `+` chain deep enough to
+    # hit __str__ recursion) must not also lose the LLM pass under --ai.
+    import frame.sil.scanner as scanner_mod
+    monkeypatch.setattr(scanner_mod.SILTranslator, "translate_program", _boom)
+    src = 'package main\nimport "os/exec"\nfunc run(command string) { exec.Command(command).Run() }\n'
+    calls, result = _run(monkeypatch, "go", src, "run.go")
+    assert any("Scan error" in e for e in result.errors)
+    assert len(calls) == 1
+
+
+def test_go_frontend_crash_still_reaches_llm(monkeypatch):
+    from frame.sil.frontends.go_frontend import GoFrontend
+    monkeypatch.setattr(GoFrontend, "translate", _boom)
+    calls, result = _run(monkeypatch, "go", "package main\n", "p.go")
+    assert any("Scan error" in e for e in result.errors)
+    assert len(calls) == 1
+
+
+def test_other_languages_symbolic_crash_is_unchanged(monkeypatch):
+    import frame.sil.scanner as scanner_mod
+    monkeypatch.setattr(scanner_mod.SILTranslator, "translate_program", _boom)
+    calls, result = _run(monkeypatch, "python", "import os\nos.system(input())\n", "f.py")
+    assert any("Scan error" in e for e in result.errors)
+    assert calls == []
