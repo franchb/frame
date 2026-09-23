@@ -402,6 +402,34 @@ def is_generated_source(source_code: str,
     return len(source_code) > limit and "\n" not in source_code
 
 
+_GO_SKIP_DIRS = frozenset({"vendor", "testdata", "third_party"})
+_GO_GENERATED_HEADER = re.compile(r"^// Code generated .* DO NOT EDIT\.\s*$", re.MULTILINE)
+
+
+def skip_go_file(path: Path, root: Path) -> bool:
+    """Go files a directory scan leaves out: vendored, test-data and
+    third-party trees, tests, and generated code (the standard `// Code
+    generated ... DO NOT EDIT.` header, with common generated filenames as a
+    fast path). None of them is the project's attack surface, and in
+    Kubernetes-scale repositories they dominate the file count."""
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        parts = path.parts
+    if any(p in _GO_SKIP_DIRS for p in parts[:-1]):
+        return True
+    name = path.name
+    if (name.endswith("_test.go") or name.endswith(".pb.go")
+            or name.startswith("zz_generated") or name.endswith("_mock.go")):
+        return True
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8192).decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    return _GO_GENERATED_HEADER.search(head) is not None
+
+
 class FrameScanner:
     """
     Main vulnerability scanner.
@@ -928,7 +956,11 @@ class FrameScanner:
         # model on every file). For an unsupported language (LLM-only mode) the user
         # explicitly opted in with --ai, so detection always runs -- the heuristic's
         # patterns are tuned for the symbolic languages and would miss PHP/Ruby/etc.
-        if self.frontend is not None and not is_detection_candidate(source_code, bool(vulns)):
+        # Go keeps the always-run behaviour it had before its frontend existed:
+        # the candidate patterns are tuned for the other languages and would
+        # silently drop Go files with no symbolic finding from the LLM pass.
+        if (self.frontend is not None and self.language != "go"
+                and not is_detection_candidate(source_code, bool(vulns))):
             return vulns
         if self._llm_client is None:
             self._llm_client = LLMTriageClient(config)
@@ -1004,6 +1036,7 @@ class FrameScanner:
             '.cxx': 'cpp',
             '.hpp': 'cpp',
             '.cs': 'csharp',
+            '.go': 'go',
         }
         detected_lang = ext_to_lang.get(path.suffix.lower(), self.language)
 
@@ -1013,7 +1046,11 @@ class FrameScanner:
             self.frontend = self._get_frontend(detected_lang)
 
         # Use utf-8-sig to automatically strip BOM (common in C# files)
-        source_code = path.read_text(encoding='utf-8-sig')
+        # Go sources in the wild carry the odd invalid byte in comments or
+        # string literals; tree-sitter recovers, so decode with replacement
+        # rather than failing the whole file.
+        errors = "replace" if path.suffix.lower() == ".go" else "strict"
+        source_code = path.read_text(encoding='utf-8-sig', errors=errors)
 
         # Minified and generated artifacts are not source: they are build output,
         # they are never the file a security advisory points at, and analysing them
@@ -1061,6 +1098,8 @@ class FrameScanner:
         try:
             for filepath in dir_path.glob(pattern):
                 if filepath.is_file():
+                    if filepath.suffix == ".go" and skip_go_file(filepath, dir_path):
+                        continue
                     result = self.scan_file(str(filepath))
                     results.append(result)
         finally:
@@ -1886,6 +1925,7 @@ def scan_file(filepath: str, language: str = None) -> ScanResult:
             ".h": "c",
             ".hpp": "cpp",
             ".cs": "csharp",
+            ".go": "go",
         }
         language = language_map.get(ext, "python")
 
