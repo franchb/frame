@@ -293,3 +293,50 @@ func b(s string, n int) string { return a(s, n) }'''
     p = _prog(src)
     assert p.procedures["go:a"].spec.taint_propagates == [0, 1]
     assert p.procedures["go:a"].spec.is_sanitizer == []
+
+
+from frame.sil.instructions import Sanitize
+
+
+def _sanitizes(proc):
+    return [(i.var.name, sorted(k.value for k in i.sanitizes))
+            for n in proc.nodes.values() for i in n.instrs if isinstance(i, Sanitize)]
+
+
+def test_guard_emits_sanitize_on_continuation():
+    src = '''package main
+import ("net/http"; "path/filepath")
+func h(w http.ResponseWriter, r *http.Request) {
+	f := r.FormValue("f")
+	if !filepath.IsLocal(f) { return }
+	_ = f
+}'''
+    assert ("f", ["filesystem"]) in _sanitizes(_prog(src).procedures["go:h"])
+
+
+def test_unrecognised_guard_emits_nothing():
+    src = '''package main
+import ("net/http")
+func h(w http.ResponseWriter, r *http.Request) {
+	f := r.FormValue("f")
+	if !check(f) { return }
+	_ = f
+}
+func check(s string) bool { return true }'''
+    assert _sanitizes(_prog(src).procedures["go:h"]) == []
+
+
+def test_facts_do_not_survive_a_join_with_an_unguarded_path():
+    src = '''package main
+import ("net/http"; "path/filepath")
+func h(w http.ResponseWriter, r *http.Request, b bool) {
+	f := r.FormValue("f")
+	if b {
+		if !filepath.IsLocal(f) { return }
+	}
+	g := f
+	_ = g
+}'''
+    # The Sanitize exists only inside the guarded branch; nothing after the join.
+    proc = _prog(src).procedures["go:h"]
+    assert _sanitizes(proc) == [("f", ["filesystem"])]

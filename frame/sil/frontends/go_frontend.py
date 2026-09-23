@@ -15,6 +15,7 @@ Go-specific parts, all syntactic (docs/superpowers/specs/2026-09-23-go-frontend-
 * sources rooted only in handler-shaped functions.
 """
 
+import re
 import sys
 from dataclasses import replace
 from typing import Dict, List, Optional, Set, Tuple
@@ -31,8 +32,9 @@ from frame.sil.types import (
     ExpFieldAccess,
 )
 from frame.sil.instructions import (
-    Call, Assign, Prune, Return, TaintSource, TaintKind, PruneKind,
+    Call, Assign, Prune, Return, TaintSource, TaintKind, PruneKind, Sanitize, SinkKind,
 )
+from frame.sil.frontends._go_guards import GuardTracker, TrustOracle
 from frame.sil.procedure import Procedure, Node, NodeKind, ProcSpec, Program
 from frame.sil.frontends._go_env import (
     GoType, UNKNOWN, BUILTIN_TYPES, FileEnv, Scope, build_file_env,
@@ -114,42 +116,104 @@ class GoFrontend:
             sys.setrecursionlimit(old_limit)
         return self._program
 
-    # Hooks replaced by Tasks 5 and 6.
+    # Hooks: guard facts, trusted roots and site sanitizers (_go_guards.py).
     def _before_lowering(self, root) -> None:
-        pass
+        self._trust = TrustOracle(root, self._src, self._env, key_of=self._call_key,
+                                  is_alias=self._is_package_alias, text=self._t)
+        self._guards = GuardTracker(self._src, self._trust, key_of=self._call_key,
+                                    arg_nodes=self._arg_nodes, const_str=self._const_str,
+                                    text=self._t)
 
     def _after_lowering(self) -> None:
         apply_same_file_flow(self._program, self._site_callees)
 
     def _on_branch(self, cond_node, truth: bool, node: Node) -> None:
-        pass
+        for var, kinds in sorted(self._guards.on_branch(cond_node, truth).items()):
+            node.add_instr(Sanitize(loc=self._loc(cond_node), var=PVar(var),
+                                    sanitizes=[SinkKind(k) for k in sorted(kinds)],
+                                    description="Go guard: " + self._t(cond_node)[:80]))
 
     def _on_assign(self, name: str, value_node) -> None:
-        pass
+        self._guards.on_assign(name, value_node)
 
     def _on_multi_assign(self, names: List[str], value_node) -> None:
-        pass
+        self._guards.on_multi_assign(names, value_node)
 
     def _on_function_start(self, node, receiver_name: str, param_names: Set[str]) -> None:
-        pass
+        self._trust.enter(node, receiver_name, param_names)
 
     def _on_function_end(self) -> None:
-        pass
+        self._trust.leave()
 
     def _facts_snapshot(self):
-        return None
+        return self._guards.snapshot() if hasattr(self, "_guards") else None
 
     def _facts_restore(self, snap) -> None:
-        pass
+        if hasattr(self, "_guards"):
+            self._guards.restore(snap)
 
     def _facts_join(self, snaps) -> None:
-        pass
+        if hasattr(self, "_guards"):
+            self._guards.join(snaps)
 
     def _facts_clear(self) -> None:
-        pass
+        if hasattr(self, "_guards"):
+            self._guards.clear()
 
     def _adjust_site_spec(self, key: str, spec: Optional[ProcSpec], arg_nodes, arg_exps):
-        return self._base_adjust_site_spec(key, spec, arg_nodes)
+        spec = self._base_adjust_site_spec(key, spec, arg_nodes)
+        if key in ("path/filepath.Join", "path.Join") and len(arg_nodes) == 2 \
+                and self._trust.trusted(arg_nodes[0]):
+            second = arg_nodes[1]
+            dotdot_free = second.type == "identifier" and self._guards.implies(
+                (self._t(second), "has_dotdot", "", False))
+            if self._is_rooted_clean(second) or dotdot_free:
+                return ProcSpec(is_sanitizer=["filesystem"], taint_propagates=[0, 1],
+                                description="Go: path confined under a trusted root")
+        if spec is not None and spec.is_sink in ("redirect", "ssrf") and spec.sink_args:
+            idx = spec.sink_args[0]
+            if idx < len(arg_nodes) and self._fixed_destination(spec.is_sink, arg_nodes[idx]):
+                return replace(spec, is_sink=None, sink_args=[])
+        return spec
+
+    def _is_rooted_clean(self, node) -> bool:
+        if node.type != "call_expression" or self._call_key(node) not in (
+                "path/filepath.Clean", "path.Clean"):
+            return False
+        args = self._arg_nodes(node)
+        arg = args[0] if args else None
+        return (arg is not None and arg.type == "binary_expression" and self._op(arg) == "+"
+                and self._const_str(arg.child_by_field_name("left")) == "/")
+
+    def _const_prefix(self, node) -> Tuple[str, bool]:
+        """(constant prefix, whole expression constant?)."""
+        whole = self._const_str(node)
+        if whole is not None:
+            return whole, True
+        if node.type == "parenthesized_expression" and node.named_children:
+            return self._const_prefix(node.named_children[0])
+        if node.type == "binary_expression" and self._op(node) == "+":
+            left, left_full = self._const_prefix(node.child_by_field_name("left"))
+            if not left_full:
+                return left, False
+            right, right_full = self._const_prefix(node.child_by_field_name("right"))
+            return left + right, right_full
+        if node.type == "call_expression" and self._call_key(node) == "fmt.Sprintf":
+            args = self._arg_nodes(node)
+            fmt_s = self._const_str(args[0]) if args else None
+            if fmt_s is not None:
+                cut = fmt_s.find("%")
+                return (fmt_s, True) if cut < 0 else (fmt_s[:cut], False)
+        return "", False
+
+    def _fixed_destination(self, kind: str, node) -> bool:
+        prefix, full = self._const_prefix(node)
+        if full:
+            return False                    # constant: carries no taint anyway
+        if kind == "ssrf":
+            return re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/?#\\]+/", prefix) is not None
+        return (len(prefix) >= 2 and prefix[0] == "/" and prefix[1] not in "/\\"
+                and "?" in prefix)
 
     # ---------------------------------------------------------------- helpers
     def _t(self, node) -> str:

@@ -2950,6 +2950,17 @@ class SILTranslator:
         the normal encoding. Returns None if no usable guard can be formed."""
         if isinstance(exp, ExpUnOp) and exp.op == "!":
             return self._feasibility_guard(exp.operand, not assume_true)
+        # Go: push the polarity down through `&&` / `||` so a bare call-result
+        # variable inside a combinator (`!ok(s) || bad(s)`) also gets the
+        # sentinel encoding. Without this, `Not(Or(Not(Var), Var))` is
+        # spuriously UNSAT and the continuation's findings are dropped. Gated
+        # to Go so other frontends keep exactly their current behaviour.
+        if self._is_go_lang and isinstance(exp, ExpBinOp) and exp.op in ("&&", "||"):
+            left = self._feasibility_guard(exp.left, assume_true)
+            right = self._feasibility_guard(exp.right, assume_true)
+            if left is None or right is None:
+                return None
+            return And(left, right) if (exp.op == "&&") == assume_true else Or(left, right)
         f = self._exp_to_formula(exp)
         if isinstance(f, Var):
             return Neq(f, Const(0)) if assume_true else Eq(f, Const(0))

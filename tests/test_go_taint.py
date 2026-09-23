@@ -261,3 +261,217 @@ def _chain(n: int, reverse: bool) -> str:
 def test_long_helper_chain_reaches_sink_in_any_definition_order():
     assert "CWE-78" in _cwes(_chain(13, reverse=False))
     assert "CWE-78" in _cwes(_chain(13, reverse=True))
+
+
+# ---- CWE-22 twins (must be silent) and bypasses (must fire) -----------------
+FS = '"net/http"\n"os"\n"path/filepath"\n"strings"'
+
+
+def test_fs_twin_base():
+    _pair("CWE-22", _handler('os.Open(r.FormValue("f"))', FS),
+          _handler('os.Open(filepath.Base(r.FormValue("f")))', FS))
+
+
+def test_fs_twin_securejoin():
+    imports = FS + '\n"github.com/cyphar/filepath-securejoin"'
+    _pair("CWE-22", _handler('p := filepath.Join("/srv", r.FormValue("f"))\nos.Open(p)', imports),
+          _handler('p, _ := securejoin.SecureJoin("/srv", r.FormValue("f"))\nos.Open(p)', imports))
+
+
+def test_fs_twin_rooted_clean_join():
+    _pair("CWE-22", _handler('os.ReadFile(filepath.Join("/srv", r.FormValue("f")))', FS),
+          _handler('os.ReadFile(filepath.Join("/srv", filepath.Clean("/" + r.FormValue("f"))))', FS))
+
+
+def test_fs_twin_separator_aware_prefix():
+    body = ('p := filepath.Clean(filepath.Join(root, r.FormValue("f")))\n'
+            'if !strings.HasPrefix(p, root+string(filepath.Separator)) { return }\n'
+            'os.ReadFile(p)')
+    vulnerable = body.replace('if !strings.HasPrefix(p, root+string(filepath.Separator)) { return }\n', '')
+    _pair("CWE-22", _handler(vulnerable, FS, 'const root = "/srv/www"'),
+          _handler(body, FS, 'const root = "/srv/www"'))
+
+
+def test_fs_twin_rel():
+    body = ('p := filepath.Join(root, r.FormValue("f"))\n'
+            'rel, err := filepath.Rel(root, p)\n'
+            'if err != nil || strings.HasPrefix(rel, "..") { return }\n'
+            'os.ReadFile(p)')
+    vulnerable = 'p := filepath.Join(root, r.FormValue("f"))\nos.ReadFile(p)'
+    _pair("CWE-22", _handler(vulnerable, FS, 'const root = "/srv/www"'),
+          _handler(body, FS, 'const root = "/srv/www"'))
+
+
+def test_fs_twin_islocal():
+    body = 'f := r.FormValue("f")\nif !filepath.IsLocal(f) { return }\nos.ReadFile(f)'
+    _pair("CWE-22", _handler('f := r.FormValue("f")\nos.ReadFile(f)', FS), _handler(body, FS))
+
+
+def test_fs_twin_dotdot_free_inside_join():
+    body = ('f := r.FormValue("f")\nif strings.Contains(f, "..") { return }\n'
+            'os.ReadFile(filepath.Join("/srv", f))')
+    _pair("CWE-22", _handler('f := r.FormValue("f")\nos.ReadFile(filepath.Join("/srv", f))', FS),
+          _handler(body, FS))
+
+
+def test_fs_twin_receiver_root_assigned_constant():
+    extra = ('type S struct{ root string }\n'
+             'func New() *S { return &S{root: "/srv"} }\n'
+             'func (s *S) Serve(w http.ResponseWriter, r *http.Request) {\n'
+             '  os.ReadFile(filepath.Join(s.root, filepath.Clean("/" + r.FormValue("f"))))\n}')
+    vulnerable = extra.replace('filepath.Clean("/" + r.FormValue("f"))', 'r.FormValue("f")')
+    _pair("CWE-22", _handler("", FS, vulnerable), _handler("", FS, extra))
+
+
+def test_fs_bypass_rooted_clean_alone():
+    src = _handler('os.ReadFile(filepath.Clean("/" + r.FormValue("f")))', FS)
+    assert "CWE-22" in _cwes(src)
+
+
+def test_fs_bypass_prefix_without_separator():
+    body = ('p := filepath.Clean(r.FormValue("f"))\n'
+            'if !strings.HasPrefix(p, "/srv/www") { return }\nos.ReadFile(p)')
+    assert "CWE-22" in _cwes(_handler(body, FS))
+
+
+def test_fs_bypass_dotdot_check_without_root():
+    body = 'f := r.FormValue("f")\nif strings.Contains(f, "..") { return }\nos.ReadFile(f)'
+    assert "CWE-22" in _cwes(_handler(body, FS))
+
+
+def test_fs_bypass_attacker_chosen_receiver_root():
+    extra = ('type S struct{ root string }\n'
+             'func (s *S) Serve(w http.ResponseWriter, r *http.Request) {\n'
+             '  s.root = r.FormValue("root")\n'
+             '  os.ReadFile(filepath.Join(s.root, filepath.Clean("/" + r.FormValue("f"))))\n}')
+    assert "CWE-22" in _cwes(_handler("", FS, extra))
+
+
+def test_unrecognised_disjunctive_guard_keeps_the_continuation_feasible():
+    # A bare call-result inside `||` must not make the false edge look UNSAT to
+    # the infeasible-path filter (independent of any guard rule).
+    body = 'f := r.FormValue("f")\nif !check(f) || other(f) { return }\nos.ReadFile(f)'
+    extra = 'func check(s string) bool { return true }\nfunc other(s string) bool { return false }'
+    assert "CWE-22" in _cwes(_handler(body, FS, extra))
+
+
+def test_fs_bypass_reassigned_after_guard():
+    body = ('f := r.FormValue("f")\nif !filepath.IsLocal(f) { return }\n'
+            'f = r.FormValue("g")\nos.ReadFile(f)')
+    assert "CWE-22" in _cwes(_handler(body, FS))
+
+
+# ---- CWE-601 --------------------------------------------------------------------
+RD = '"net/http"\n"net/url"\n"strings"'
+
+
+def test_redirect_twin_relative_path_full_check():
+    body = ('next := r.FormValue("next")\n'
+            'if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || '
+            'strings.Contains(next, "\\\\") || strings.ContainsAny(next, "\\r\\n\\t") { return }\n'
+            'http.Redirect(w, r, next, 302)')
+    _pair("CWE-601", _handler('next := r.FormValue("next")\nhttp.Redirect(w, r, next, 302)', RD),
+          _handler(body, RD))
+
+
+def test_redirect_twin_url_parse_full_check():
+    body = ('next := r.FormValue("next")\nu, err := url.Parse(next)\n'
+            'if err != nil || u.IsAbs() || u.Host != "" || strings.Contains(next, "\\\\") { return }\n'
+            'http.Redirect(w, r, next, 302)')
+    vulnerable = 'next := r.FormValue("next")\nu, _ := url.Parse(next)\n_ = u\nhttp.Redirect(w, r, next, 302)'
+    _pair("CWE-601", _handler(vulnerable, RD), _handler(body, RD))
+
+
+def test_redirect_twin_host_allowlist():
+    body = ('u, err := url.Parse(r.FormValue("next"))\n'
+            'if err != nil || u.Hostname() != "example.com" { return }\n'
+            'http.Redirect(w, r, u.String(), 302)')
+    vulnerable = body.replace('if err != nil || u.Hostname() != "example.com" { return }\n', '_ = err\n')
+    _pair("CWE-601", _handler(vulnerable, RD), _handler(body, RD))
+
+
+def test_redirect_twin_constant_prefix_with_query():
+    _pair("CWE-601", _handler('http.Redirect(w, r, r.FormValue("q"), 302)', RD),
+          _handler('http.Redirect(w, r, "/search?q="+r.FormValue("q"), 302)', RD))
+
+
+def test_redirect_bypass_isabs_only():
+    body = ('next := r.FormValue("next")\nu, err := url.Parse(next)\n'
+            'if err != nil || u.IsAbs() { return }\nhttp.Redirect(w, r, next, 302)')
+    assert "CWE-601" in _cwes(_handler(body, RD))
+
+
+def test_redirect_bypass_no_backslash_check():
+    body = ('next := r.FormValue("next")\n'
+            'if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") { return }\n'
+            'http.Redirect(w, r, next, 302)')
+    assert "CWE-601" in _cwes(_handler(body, RD))
+
+
+def test_redirect_bypass_leading_backslash_only():
+    body = ('next := r.FormValue("next")\n'
+            'if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || '
+            'strings.HasPrefix(next, "/\\\\") { return }\nhttp.Redirect(w, r, next, 302)')
+    assert "CWE-601" in _cwes(_handler(body, RD))
+
+
+def test_redirect_bypass_no_control_char_check():
+    body = ('next := r.FormValue("next")\n'
+            'if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || '
+            'strings.Contains(next, "\\\\") { return }\nhttp.Redirect(w, r, next, 302)')
+    assert "CWE-601" in _cwes(_handler(body, RD))
+
+
+def test_redirect_bypass_slash_prefix():
+    assert "CWE-601" in _cwes(_handler('http.Redirect(w, r, "/"+r.FormValue("n"), 302)', RD))
+
+
+def test_redirect_bypass_constant_path_prefix():
+    assert "CWE-601" in _cwes(_handler('http.Redirect(w, r, "/safe/"+r.FormValue("n"), 302)', RD))
+
+
+# ---- CWE-918 ------------------------------------------------------------------------
+def test_ssrf_twin_constant_authority():
+    _pair("CWE-918", _handler('http.Get(r.FormValue("id"))', RD),
+          _handler('http.Get("https://api.example.com/v1/items?id=" + r.FormValue("id"))', RD))
+
+
+def test_ssrf_twin_host_allowlist():
+    body = ('u, err := url.Parse(r.FormValue("u"))\n'
+            'if err != nil || u.Hostname() != "api.example.com" { return }\nhttp.Get(u.String())')
+    vulnerable = body.replace('if err != nil || u.Hostname() != "api.example.com" { return }\n', '_ = err\n')
+    _pair("CWE-918", _handler(vulnerable, RD), _handler(body, RD))
+
+
+def test_ssrf_bypass_query_escaped_host():
+    src = _handler('http.Get("http://" + url.QueryEscape(r.FormValue("h")) + "/latest/meta-data/")', RD)
+    assert "CWE-918" in _cwes(src)
+
+
+def test_ssrf_bypass_open_authority():
+    assert "CWE-918" in _cwes(_handler('http.Get("https://" + r.FormValue("h"))', RD))
+
+
+# ---- CWE-79 / CWE-770 -----------------------------------------------------------------
+HT = '"html"\n"html/template"\n"net/http"'
+
+
+def test_html_twin_escaped():
+    _pair("CWE-79", _handler('_ = template.HTML(r.FormValue("x"))', HT),
+          _handler('_ = template.HTML(html.EscapeString(r.FormValue("x")))', HT))
+
+
+def test_html_bypass_unescaped():
+    assert "CWE-79" in _cwes(_handler('_ = template.HTML(r.FormValue("x"))', HT))
+
+
+def test_template_js_is_out_of_scope():
+    assert "CWE-79" not in _cwes(_handler('_ = template.JS(html.EscapeString(r.FormValue("x")))', HT))
+
+
+def test_alloc_twin_bounded():
+    body = ('n, _ := strconv.Atoi(r.FormValue("n"))\nif n > 1048576 { return }\n'
+            'buf := make([]byte, n)\n_ = buf')
+    imports = '"net/http"\n"strconv"'
+    _pair("CWE-770", _handler(body.replace('if n > 1048576 { return }\n', ''), imports),
+          _handler(body, imports))
