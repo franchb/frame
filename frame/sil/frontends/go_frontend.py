@@ -495,6 +495,10 @@ class GoFrontend:
             base = self._t(node.child_by_field_name("name"))
             name = f"go:{receiver[1].path}.{base}" if is_method else f"go:{base}"
         all_params = ([receiver] if receiver else []) + params
+        plist = node.child_by_field_name("parameters")
+        if plist is not None and plist.named_children \
+                and plist.named_children[-1].type == "variadic_parameter_declaration":
+            self._variadic_procs.add(name)
         results = params_of(node.child_by_field_name("result"), self._src, self._env.imports)
         proc = Procedure(
             name=name,

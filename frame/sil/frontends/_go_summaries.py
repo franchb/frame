@@ -187,11 +187,22 @@ def _has_own_source(proc: Procedure) -> bool:
 
 
 def _summarize(proc: Procedure, program: Program, conservative: bool,
-               guard_at: Optional[GuardAt] = None) -> None:
+               guard_at: Optional[GuardAt] = None, variadic_arity: int = 0) -> None:
+    """`variadic_arity` > 0 for a variadic procedure: the most arguments any
+    same-file site passes, so arguments folded into the last parameter
+    propagate whenever it does (every site shares this spec object)."""
     spec = proc.spec
     offset = 1 if proc.is_method else 0
     n_args = max(0, len(proc.params) - offset)
     spec.description = f"Go same-file summary of {proc.name}"
+    _summarize_flows(proc, program, conservative, guard_at, spec, offset, n_args)
+    last = n_args - 1
+    if variadic_arity > n_args and last in spec.taint_propagates:
+        spec.taint_propagates = sorted(set(spec.taint_propagates) | set(range(n_args, variadic_arity)))
+
+
+def _summarize_flows(proc: Procedure, program: Program, conservative: bool,
+                     guard_at: Optional[GuardAt], spec: ProcSpec, offset: int, n_args: int) -> None:
     if conservative:
         spec.taint_propagates = list(range(n_args))
         spec.taint_from_receiver = proc.is_method
@@ -270,10 +281,19 @@ def apply_same_file_flow(program: Program, site_callees: Dict[str, str],
                 callee = site_callees.get(ins.get_full_name())
                 if callee in procs:
                     graph[n].add(callee)
+    variadic = variadic or set()
+    arity: Dict[str, int] = {}
+    for p in procs.values():
+        for ins in _instrs(p):
+            if isinstance(ins, Call):
+                callee = site_callees.get(ins.get_full_name())
+                if callee in variadic:
+                    arity[callee] = max(arity.get(callee, 0), len(ins.args))
     for comp in _sccs(graph):
         recursive = len(comp) > 1 or any(n in graph[n] for n in comp)
         for n in comp:
-            _summarize(procs[n], program, conservative=recursive, guard_at=guard_at)
+            _summarize(procs[n], program, conservative=recursive, guard_at=guard_at,
+                       variadic_arity=arity.get(n, 0))
     # 3. Into callees, to a fixpoint. marks[(callee, param index)] holds the
     # sink kinds sanitized on EVERY tainted flow into that parameter, over all
     # call sites. Marks are only added or narrowed, so the loop terminates.
@@ -294,8 +314,19 @@ def apply_same_file_flow(program: Program, site_callees: Dict[str, str],
                     continue
                 offset = 1 if callee.is_method else 0
                 guarded = guard_at.get(id(ins), {})
-                hits = {j + offset: _site_kinds(flows, exp_vars(a), guarded)
-                        for j, (a, _) in enumerate(ins.args)}
+                last = len(callee.params) - 1
+                hits: Dict[int, Optional[FrozenSet[str]]] = {}
+                for j, (a, _) in enumerate(ins.args):
+                    idx = j + offset
+                    kinds = _site_kinds(flows, exp_vars(a), guarded)
+                    if cname in variadic and idx > last:
+                        # Arguments past the last parameter are elements of
+                        # the variadic slice: fold them into it, keeping only
+                        # kinds every tainted one is sanitized for.
+                        idx = last
+                    if idx in hits and hits[idx] is not None:
+                        kinds = hits[idx] if kinds is None else hits[idx] & kinds
+                    hits[idx] = kinds
                 if callee.is_method:
                     recv = _receiver_of(ins.get_full_name())
                     hits[0] = _site_kinds(flows, [recv] if recv else [], guarded)

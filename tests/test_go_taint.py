@@ -1070,3 +1070,29 @@ def test_guarding_helper_is_a_sanitizer_summary():
     assert "CWE-78" in _cwes(_handler('exec.Command(clean(r.FormValue("p")))',
                                       FS + '\n"os/exec"', silent))
 
+
+# ---- variadic same-file calls ----------------------------------------------------------
+def test_variadic_argument_reaches_sink_in_callee():
+    extra = "func run(args ...string) { exec.Command(args[1]) }"
+    _pair("CWE-78", _handler('run("a", r.FormValue("x"))', EX, extra),
+          _handler('run("a", "b")', EX, extra))
+
+
+def test_variadic_after_fixed_parameter_reaches_sink_in_callee():
+    extra = "func run(name string, args ...string) { exec.Command(args[0]) }"
+    _pair("CWE-78", _handler('run("n", "a", r.FormValue("x"))', EX, extra),
+          _handler('run(r.FormValue("x"), "a", "b")', EX, extra))
+
+
+def test_variadic_into_callee_sanitization_is_intersected():
+    extra = "func readAll(ps ...string) { os.ReadFile(ps[0]) }"
+    _pair("CWE-22",
+          _handler('readAll(filepath.Base(r.FormValue("a")), r.FormValue("b"))', FS, extra),
+          _handler('readAll(filepath.Base(r.FormValue("a")), filepath.Base(r.FormValue("b")))',
+                   FS, extra))
+
+
+def test_variadic_argument_propagates_out_of_callee():
+    extra = 'func join(parts ...string) string { s := ""; for _, p := range parts { s += p }; return s }'
+    _pair("CWE-78", _handler('exec.Command(join("a", r.FormValue("x")))', EX, extra),
+          _handler('exec.Command(join("a", "b"))', EX, extra))
