@@ -376,7 +376,8 @@ def test_redirect_twin_relative_path_full_check():
 
 def test_redirect_twin_url_parse_full_check():
     body = ('next := r.FormValue("next")\nu, err := url.Parse(next)\n'
-            'if err != nil || u.IsAbs() || u.Host != "" || strings.Contains(next, "\\\\") { return }\n'
+            'if err != nil || u.IsAbs() || u.Host != "" || strings.HasPrefix(next, "//") || '
+            'strings.Contains(next, "\\\\") { return }\n'
             'http.Redirect(w, r, next, 302)')
     vulnerable = 'next := r.FormValue("next")\nu, _ := url.Parse(next)\n_ = u\nhttp.Redirect(w, r, next, 302)'
     _pair("CWE-601", _handler(vulnerable, RD), _handler(body, RD))
@@ -995,3 +996,15 @@ def test_shadow_of_a_named_result_keeps_the_bare_return():
     silent = 'func pick(s string) (out string) { out = "x"; { out := s; _ = out }; return }'
     body = 'exec.Command(pick(r.FormValue("c")))'
     _pair("CWE-78", _handler(body, EX, firing), _handler(body, EX, silent))
+
+
+def test_redirect_bypass_url_parse_rule_without_double_slash_check_echo():
+    # `///evil.example` parses with Host "" and IsAbs false, err nil; echo
+    # writes Location raw and browsers go to evil.example.
+    guard = ('next := c.QueryParam("next")\nu, err := url.Parse(next)\n'
+             'if err != nil || u.IsAbs() || u.Host != "" || strings.Contains(next, "\\\\")%s { return nil }\n'
+             'return c.Redirect(302, next)')
+    src = ('package main\nimport (\n"net/url"\n"strings"\n"github.com/labstack/echo/v4"\n)\n'
+           'func h(c echo.Context) error {\n%s\n}\n')
+    _pair("CWE-601", src % (guard % ""),
+          src % (guard % ' || strings.HasPrefix(next, "//")'))

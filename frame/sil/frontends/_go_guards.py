@@ -896,8 +896,11 @@ class GuardTracker:
         no_ctrl = imp((v, "has_ctrl", "", False)) or imp((v, "url_err", "", False))
         if imp((v, "prefix", "/", True)) and imp((v, "prefix", "//", False)) and no_bs and no_ctrl:
             kinds.add(REDIRECT)
+        # `///evil.example` parses with an empty Host and IsAbs false, so the
+        # url.Parse rule also needs the `//` prefix rejected.
         if (imp((v, "url_err", "", False)) and imp((v, "url_abs", "", False))
-                and imp((v, "url_host_nonempty", "", False)) and no_bs):
+                and imp((v, "url_host_nonempty", "", False)) and no_bs
+                and imp((v, "prefix", "//", False))):
             kinds.add(REDIRECT)
         if imp((v, "host_allowed", "", True)):
             kinds |= {REDIRECT, SSRF}
