@@ -631,18 +631,21 @@ class GuardTracker:
         # `..` and root parts of the rule must all come from one call.
         self.rel_src: Dict[str, Tuple[Optional[str], str, str]] = {}
         self.rel_err: Dict[str, Tuple[str, str]] = {}
+        # `_, ok := allowlist[u.Hostname()]`: ok var -> the URL vars whose
+        # host_allowed literal `ok` stands for.
+        self.ok_host: Dict[str, Tuple[str, ...]] = {}
 
     def snapshot(self):
         return (self.clauses, dict(self.emitted), self.normalized, dict(self.url_src),
-                dict(self.url_err), dict(self.rel_src), dict(self.rel_err))
+                dict(self.url_err), dict(self.rel_src), dict(self.rel_err), dict(self.ok_host))
 
     def restore(self, snap) -> None:
         if snap is None:
             self.clear()
             return
-        (self.clauses, emitted, self.normalized, url_src, url_err, rel_src, rel_err) = snap
+        (self.clauses, emitted, self.normalized, url_src, url_err, rel_src, rel_err, ok_host) = snap
         self.emitted, self.url_src, self.url_err = dict(emitted), dict(url_src), dict(url_err)
-        self.rel_src, self.rel_err = dict(rel_src), dict(rel_err)
+        self.rel_src, self.rel_err, self.ok_host = dict(rel_src), dict(rel_err), dict(ok_host)
 
     def join(self, snaps: list) -> None:
         live = [s for s in snaps if s is not None]
@@ -658,13 +661,13 @@ class GuardTracker:
             normalized &= s[2]
             emitted = {k: v & s[1][k] for k, v in emitted.items() if k in s[1]}
         maps = []
-        for idx in (3, 4, 5, 6):
+        for idx in (3, 4, 5, 6, 7):
             merged = dict(first[idx])
             for s in live[1:]:
                 merged = {k: v for k, v in merged.items() if s[idx].get(k) == v}
             maps.append(merged)
         self.clauses, self.emitted, self.normalized = clauses, emitted, normalized
-        self.url_src, self.url_err, self.rel_src, self.rel_err = maps
+        self.url_src, self.url_err, self.rel_src, self.rel_err, self.ok_host = maps
 
     def kill(self, var: str) -> None:
         self.clauses = frozenset(c for c in self.clauses if all(l[0] != var for l in c))
@@ -677,6 +680,8 @@ class GuardTracker:
             del self.rel_err[k]
         for k in [k for k, (_, p, _) in self.rel_src.items() if k == var or p == var]:
             del self.rel_src[k]
+        for k in [k for k, us in self.ok_host.items() if k == var or var in us]:
+            del self.ok_host[k]
 
     # ---- assignments
     def on_assign(self, name: str, value_node) -> None:
@@ -688,6 +693,13 @@ class GuardTracker:
 
     def on_multi_assign(self, names: List[str], value_node) -> None:
         value_node = _strip(value_node)
+        if value_node is not None and value_node.type == "index_expression" \
+                and len(names) == 2 and names[1] != "_":
+            # Comma-ok membership, the only form for a map[string]struct{} set.
+            host_u = self._host_var(value_node.child_by_field_name("index"))
+            if host_u and self.trust.trusted(value_node.child_by_field_name("operand")):
+                self.ok_host[names[1]] = tuple(self._url_vars(host_u))
+            return
         if value_node is None or value_node.type != "call_expression" or len(names) < 2:
             return
         key = self.key_of(value_node)
@@ -773,6 +785,11 @@ class GuardTracker:
 
     def _atom(self, node, truth: bool) -> List[Clause]:
         t = node.type
+        if t == "identifier":
+            ok = self._var(node)
+            if ok in self.ok_host:
+                return self._clauses(list(self.ok_host[ok]), "host_allowed", "", truth)
+            return [_UNKNOWN]
         if t == "call_expression":
             return self._call_atom(node, truth)
         if t == "binary_expression" and self._op(node) in ("==", "!="):

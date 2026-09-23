@@ -1008,3 +1008,31 @@ def test_redirect_bypass_url_parse_rule_without_double_slash_check_echo():
            'func h(c echo.Context) error {\n%s\n}\n')
     _pair("CWE-601", src % (guard % ""),
           src % (guard % ' || strings.HasPrefix(next, "//")'))
+
+
+# ---- comma-ok allowlist membership -------------------------------------------------------
+SET_ALLOWED = 'var allowed = map[string]struct{}{"api.example.com": {}}'
+COMMA_OK = ('s := r.FormValue("u")\nu, err := url.Parse(s)\nif err != nil { return }\n'
+            'if _, ok := allowed[u.Hostname()]; !ok { return }\nhttp.Get(s)')
+
+
+def test_ssrf_twin_comma_ok_allowlist():
+    tainted = SET_ALLOWED + _ADD % 'allowed[r.FormValue("h")] = struct{}{}'
+    _pair("CWE-918", _handler(COMMA_OK, RD, tainted), _handler(COMMA_OK, RD, SET_ALLOWED))
+
+
+def test_ssrf_bypass_comma_ok_without_reject_branch():
+    body = COMMA_OK.replace('if _, ok := allowed[u.Hostname()]; !ok { return }',
+                            'if _, ok := allowed[u.Hostname()]; !ok { _ = ok }')
+    assert "CWE-918" in _cwes(_handler(body, RD, SET_ALLOWED))
+
+
+def test_ssrf_comma_ok_binding_is_killed_by_reassignment():
+    body = ('s := r.FormValue("u")\nu, err := url.Parse(s)\nif err != nil { return }\n'
+            '_, ok := allowed[u.Hostname()]\n%s\nif !ok { return }\nhttp.Get(s)')
+    _pair("CWE-918", _handler(body % 'ok = true', RD, SET_ALLOWED),
+          _handler(body % '', RD, SET_ALLOWED))
+    # Re-parsing the URL after the lookup also breaks the binding.
+    reparsed = body % 'u, err = url.Parse(r.FormValue("v"))\n_ = err'
+    assert "CWE-918" in _cwes(_handler(reparsed.replace("http.Get(s)", "http.Get(u.String())"),
+                                       RD, SET_ALLOWED))
