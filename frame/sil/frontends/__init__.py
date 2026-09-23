@@ -12,6 +12,7 @@ Available frontends:
 - CFrontend: C source code
 - CppFrontend: C++ source code
 - CSharpFrontend: C# source code (planned)
+- GoFrontend: Go source code
 """
 
 from frame.sil.frontends.python_frontend import PythonFrontend
@@ -53,6 +54,14 @@ except ImportError:
     CSHARP_FRONTEND_AVAILABLE = False
     CSharpFrontend = None
 
+# Go frontend
+try:
+    from frame.sil.frontends.go_frontend import GoFrontend, TREE_SITTER_GO_AVAILABLE
+    GO_FRONTEND_AVAILABLE = TREE_SITTER_GO_AVAILABLE
+except ImportError:
+    GO_FRONTEND_AVAILABLE = False
+    GoFrontend = None
+
 __all__ = [
     "PythonFrontend",
     "JavaScriptFrontend",
@@ -65,4 +74,6 @@ __all__ = [
     "JAVA_FRONTEND_AVAILABLE",
     "C_FRONTEND_AVAILABLE",
     "CSHARP_FRONTEND_AVAILABLE",
+    "GoFrontend",
+    "GO_FRONTEND_AVAILABLE",
 ]

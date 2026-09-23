@@ -736,6 +736,11 @@ class FrameScanner:
         elif language == "csharp":
             from frame.sil.frontends.csharp_frontend import CSharpFrontend
             return CSharpFrontend()
+        elif language == "go":
+            from frame.sil.frontends.go_frontend import GoFrontend
+            fe = GoFrontend()
+            fe.taint_exported_params = self.library_mode
+            return fe
         else:
             # No symbolic frontend for this language. Return None rather than raise:
             # under --ai the scan still runs the language-agnostic LLM-detect layer
