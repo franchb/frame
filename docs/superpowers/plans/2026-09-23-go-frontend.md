@@ -99,7 +99,7 @@ sanitization. The Go frontend's design (docs/superpowers/specs/
 
 from frame.sil.types import Ident, PVar, Typ, Location, ExpVar, ExpConst, ExpBinOp
 from frame.sil.instructions import (
-    Call, Assign, TaintSource, Sanitize, TaintKind, SinkKind,
+    Call, Assign, Prune, Return, TaintSource, Sanitize, TaintKind, SinkKind,
 )
 from frame.sil.procedure import Procedure, Program, ProcSpec, NodeKind
 from frame.sil.translator import SILTranslator
@@ -238,6 +238,60 @@ def test_self_update_keeps_taint_and_drops_sanitization_it_no_longer_has():
     assert "filesystem" in _sink_types(instrs, OPEN)
 
 
+def test_plain_flow_fires():
+    # Positive counterpart of the sanitize test above: without the Sanitize the
+    # same flow must fire, or that test proves nothing.
+    instrs = [_src("p"), Assign(loc=LOC, id=PVar("q"), exp=_v("p")),
+              _call("f", "go:os.Open", _v("q"))]
+    assert "filesystem" in _sink_types(instrs, OPEN)
+
+
+def _branch_program(entry_instrs, cond, then_instrs, else_instrs, specs):
+    """entry --(Prune cond T | Prune cond F)--> then / else: the two-way layout
+    the Go frontend emits (both prunes in the branching node, successor 0 is the
+    true side), matching SILTranslator._branch_edge_formula."""
+    proc = Procedure(name="go:f", loc=LOC)
+    entry = proc.new_node(NodeKind.ENTRY)
+    proc.add_node(entry)
+    proc.entry_node = entry.id
+    entry.instrs.extend(entry_instrs)
+    entry.instrs.append(Prune(loc=LOC, condition=cond, is_true_branch=True))
+    entry.instrs.append(Prune(loc=LOC, condition=cond, is_true_branch=False))
+    then_node, else_node = proc.new_node(), proc.new_node()
+    exit_node = proc.new_node(NodeKind.EXIT)
+    for n in (then_node, else_node, exit_node):
+        proc.add_node(n)
+    proc.exit_node = exit_node.id
+    then_node.instrs.extend(then_instrs)
+    else_node.instrs.extend(else_instrs)
+    proc.connect(entry.id, then_node.id)
+    proc.connect(entry.id, else_node.id)
+    proc.connect(then_node.id, exit_node.id)
+    proc.connect(else_node.id, exit_node.id)
+    program = Program(language="go", exact_spec_lookup=True, library_specs=dict(specs))
+    program.add_procedure(proc)
+    return {c.sink_type for c in SILTranslator(program).translate_program()}
+
+
+MAKE = {"go:make": ProcSpec(is_sink="alloc_size", sink_args=[1, 2])}
+
+
+def test_bound_on_the_branch_edge_discharges_alloc_size():
+    make = _call("m", "go:make", ExpConst.string("[]byte"), _v("n"))
+    bounded = _branch_program([_src("n")], ExpBinOp(">", _v("n"), ExpConst.integer(1048576)),
+                              [Return(loc=LOC, value=None)], [make], MAKE)
+    assert "alloc_size" not in bounded
+    unbounded = _branch_program([_src("n")], ExpBinOp(">", _v("k"), ExpConst.integer(1)),
+                                [Return(loc=LOC, value=None)], [make], MAKE)
+    assert "alloc_size" in unbounded
+
+
+def test_constant_false_branch_is_dead():
+    sink = _call("f", "go:os.Open", _v("p"))
+    assert "filesystem" not in _branch_program([_src("p")], ExpConst.boolean(False), [sink], [], OPEN)
+    assert "filesystem" in _branch_program([_src("p")], ExpConst.boolean(True), [sink], [], OPEN)
+
+
 def test_noreturn_names_do_not_cut_go_paths():
     # "exit" and "err" are C no-return names; in Go they are ordinary
     # identifiers and must not end the path before the sink.
@@ -252,7 +306,7 @@ Run: `.venv/bin/python -m pytest tests/test_go_translator_contract.py -v`
 Expected before the change:
 - FAIL (TypeError, unexpected keyword `exact_spec_lookup`): every test.
 
-After Step 3 adds only the field and the exact branch, re-run and expect `test_reassignment_replaces_sanitization`, `test_self_update_keeps_taint_and_drops_sanitization_it_no_longer_has` and `test_noreturn_names_do_not_cut_go_paths` to FAIL; `test_reassignment_to_constant_clears_taint` may pass or fail at this point (Step 4 makes it pass either way). The exact-lookup tests, `test_atoi_sanitizes_injection_but_keeps_alloc_size` and `test_sanitize_carries_through_plain_assignment` characterise existing behaviour and must PASS after Step 3. **If either of those two fails, stop and report it with the output**: the spec's sanitizer encoding assumes them, and the fix must be discussed rather than guessed.
+After Step 3 adds only the field and the exact branch, re-run and expect `test_reassignment_replaces_sanitization`, `test_self_update_keeps_taint_and_drops_sanitization_it_no_longer_has` and `test_noreturn_names_do_not_cut_go_paths` to FAIL; `test_reassignment_to_constant_clears_taint` may pass or fail at this point (Step 4 makes it pass either way). The exact-lookup tests, `test_atoi_sanitizes_injection_but_keeps_alloc_size`, `test_sanitize_carries_through_plain_assignment`, `test_plain_flow_fires`, `test_bound_on_the_branch_edge_discharges_alloc_size` and `test_constant_false_branch_is_dead` characterise existing behaviour and must PASS after Step 3. **If any of them fails, stop and report it with the output**: the spec's sanitizer encoding and the Go frontend's branch layout (Task 4 `_branch`) assume them, and the fix must be discussed rather than guessed.
 
 - [ ] **Step 3: Add `exact_spec_lookup` to `Program`**
 
@@ -358,12 +412,12 @@ and add these two methods directly after `_exec_assign`'s definition ends (befor
 - [ ] **Step 5: Run the contract tests**
 
 Run: `.venv/bin/python -m pytest tests/test_go_translator_contract.py -v`
-Expected: all 9 PASS.
+Expected: all 12 PASS.
 
 - [ ] **Step 6: Run the full suite against the baseline**
 
 Run: `.venv/bin/python -m pytest tests/ -q -W ignore::pytest.PytestCollectionWarning 2>&1 | tail -3`
-Expected: baseline count + 9 passed, and no new failures.
+Expected: baseline count + 12 passed, and no new failures.
 
 - [ ] **Step 7: Commit**
 
@@ -1357,6 +1411,21 @@ func f() {
     assert all(not n.preds for n in remove_nodes)
 
 
+def test_if_uses_the_translators_two_way_branch_layout():
+    src = '''package main
+func f(n int) {
+	if n > 10 { g() } else { h() }
+}'''
+    proc = _prog(src).procedures["go:f"]
+    branching = [n for n in proc.nodes.values()
+                 if [type(i).__name__ for i in n.instrs].count("Prune") == 2]
+    assert len(branching) == 1
+    node = branching[0]
+    prunes = [i for i in node.instrs if type(i).__name__ == "Prune"]
+    assert prunes[0].is_true_branch and not prunes[1].is_true_branch
+    assert len(node.succs) == 2
+
+
 def test_infinite_loop_never_claims_body_cannot_exit():
     src = '''package main
 func serve(l Listener) {
@@ -1421,6 +1490,13 @@ def _handler(body: str, imports: str = '"net/http"', extra: str = "") -> str:
             f"func h(w http.ResponseWriter, r *http.Request) {{\n{body}\n}}\n")
 
 
+def _pair(cwe: str, vulnerable: str, patched: str) -> None:
+    """A patched twin proves something only if the same shape without the fix
+    fires: otherwise a broken propagation step would make every twin pass."""
+    assert cwe in _cwes(vulnerable), "vulnerable counterpart must fire"
+    assert cwe not in _cwes(patched), "patched twin must be silent"
+
+
 SQL_IMPORTS = '"database/sql"\n"net/http"'
 
 
@@ -1432,10 +1508,11 @@ def test_sqli_fires():
 
 
 def test_parameterized_query_is_silent():
-    src = _handler('id := r.URL.Query().Get("id")\n'
-                   'db.Query("SELECT * FROM t WHERE id = $1", id)',
-                   SQL_IMPORTS, "var db *sql.DB")
-    assert "CWE-89" not in _cwes(src)
+    _pair("CWE-89",
+          _handler('id := r.URL.Query().Get("id")\ndb.Query("SELECT * FROM t WHERE id = " + id)',
+                   SQL_IMPORTS, "var db *sql.DB"),
+          _handler('id := r.URL.Query().Get("id")\ndb.Query("SELECT * FROM t WHERE id = $1", id)',
+                   SQL_IMPORTS, "var db *sql.DB"))
 
 
 def test_query_on_non_sql_type_is_silent():
@@ -1533,9 +1610,11 @@ def test_guarded_exit_still_ends_that_path():
 
 
 def test_len_is_untainted_for_make():
-    src = _handler('body, _ := io.ReadAll(r.Body)\nbuf := make([]byte, len(body))\n_ = buf',
-                   '"io"\n"net/http"')
-    assert "CWE-770" not in _cwes(src)
+    imports = '"io"\n"net/http"\n"strconv"'
+    _pair("CWE-770",
+          _handler('body, _ := io.ReadAll(r.Body)\nn, _ := strconv.Atoi(string(body))\n'
+                   'buf := make([]byte, n)\n_ = buf', imports),
+          _handler('body, _ := io.ReadAll(r.Body)\nbuf := make([]byte, len(body))\n_ = buf', imports))
 
 
 def test_tainted_make_size_fires():
@@ -1545,10 +1624,12 @@ def test_tainted_make_size_fires():
 
 
 def test_atoi_before_sql_is_silent():
-    src = _handler('n, _ := strconv.Atoi(r.FormValue("n"))\n'
-                   'db.Query(fmt.Sprintf("SELECT * FROM t LIMIT %d", n))',
-                   '"database/sql"\n"fmt"\n"net/http"\n"strconv"', "var db *sql.DB")
-    assert "CWE-89" not in _cwes(src)
+    imports = '"database/sql"\n"fmt"\n"net/http"\n"strconv"'
+    _pair("CWE-89",
+          _handler('n := r.FormValue("n")\ndb.Query(fmt.Sprintf("SELECT * FROM t LIMIT %s", n))',
+                   imports, "var db *sql.DB"),
+          _handler('n, _ := strconv.Atoi(r.FormValue("n"))\n'
+                   'db.Query(fmt.Sprintf("SELECT * FROM t LIMIT %d", n))', imports, "var db *sql.DB"))
 
 
 def test_env_and_args_are_not_sources():
@@ -2156,6 +2237,20 @@ class GoFrontend:
             sig = self._env.methods.get(tuple(name.rsplit(".", 1)))
         return sig.results if sig is not None else []
 
+    def _branch(self, before: Optional[Node], cond: Exp, true_node: Node, false_node: Node,
+                loc: Location, true_kind: PruneKind, false_kind: PruneKind) -> None:
+        """A clean 2-way branch in the layout SILTranslator is built for: both
+        prunes in the branching node, successor 0 = true side, successor 1 =
+        false side. `_branch_edge_formula` derives the per-edge feasibility
+        guards (CWE-770 bound check, infeasible-path filter) and constant-folding
+        edge skips from exactly this shape."""
+        if before is None:
+            return
+        before.add_instr(Prune(loc=loc, condition=cond, is_true_branch=True, kind=true_kind))
+        before.add_instr(Prune(loc=loc, condition=cond, is_true_branch=False, kind=false_kind))
+        self._proc.connect(before.id, true_node.id)
+        self._proc.connect(before.id, false_node.id)
+
     def _lower_if(self, node) -> None:
         outer = self._scope
         self._scope = outer.child()
@@ -2167,14 +2262,12 @@ class GoFrontend:
         before = self._node
         base = self._facts_snapshot()
         loc = self._loc(node)
+        then_node, else_node = self._new_node(), self._new_node()
         join = self._new_node(NodeKind.JOIN)
+        self._branch(before, cond, then_node, else_node, loc, PruneKind.IF_TRUE, PruneKind.IF_FALSE)
         ends = []
-        for truth, branch in ((True, node.child_by_field_name("consequence")),
-                              (False, node.child_by_field_name("alternative"))):
-            bnode = self._new_node()
-            self._connect(before, bnode)
-            bnode.add_instr(Prune(loc=loc, condition=cond, is_true_branch=truth,
-                                  kind=PruneKind.IF_TRUE if truth else PruneKind.IF_FALSE))
+        for truth, branch, bnode in ((True, node.child_by_field_name("consequence"), then_node),
+                                     (False, node.child_by_field_name("alternative"), else_node)):
             self._node = bnode
             self._facts_restore(base)
             if cond_node is not None:
@@ -2215,19 +2308,15 @@ class GoFrontend:
         self._connect(self._node, head)
         exit_node = self._new_node(NodeKind.JOIN)
         body_node = self._new_node()
-        self._proc.connect(head.id, body_node.id)
         self._node = head
         if cond_node is not None:
-            cond = self._lower_expr(cond_node)
-            body_node.add_instr(Prune(loc=loc, condition=cond, is_true_branch=True,
-                                      kind=PruneKind.LOOP_ENTER))
-            leave = self._new_node()
-            self._proc.connect(self._node.id, leave.id)
-            leave.add_instr(Prune(loc=loc, condition=cond, is_true_branch=False,
-                                  kind=PruneKind.LOOP_EXIT))
-            self._proc.connect(leave.id, exit_node.id)
-        elif range_value is not None:
-            self._proc.connect(head.id, exit_node.id)
+            cond = self._lower_expr(cond_node)          # calls in the condition run in the head
+            self._branch(head, cond, body_node, exit_node, loc,
+                         PruneKind.LOOP_ENTER, PruneKind.LOOP_EXIT)
+        else:
+            self._proc.connect(head.id, body_node.id)
+            if range_value is not None:                 # range may run zero times
+                self._proc.connect(head.id, exit_node.id)
         cont = self._new_node() if update is not None else head
         self._breakables.append(_Breakable(exit_node, cont, label))
         self._node = body_node
@@ -2249,6 +2338,9 @@ class GoFrontend:
         self._scope = outer
 
     def _lower_switch(self, node, label: Optional[str]) -> None:
+        """Expression cases become a chain of clean 2-way tests (the translator's
+        branch layout); type-switch and select cases, which have no value
+        condition, are nondeterministic successors of the test node."""
         outer = self._scope
         self._scope = outer.child()
         loc = self._loc(node)
@@ -2258,35 +2350,44 @@ class GoFrontend:
         tag_node = node.child_by_field_name("value")
         tag = self._lower_expr(tag_node) if tag_node is not None and node.type != "select_statement" else None
         alias = node.child_by_field_name("alias")
-        before = self._node
         base = self._facts_snapshot()
         exit_node = self._new_node(NodeKind.JOIN)
-        self._breakables.append(_Breakable(exit_node, None, label))
         cases = [c for c in node.named_children
                  if c.type in ("expression_case", "type_case", "default_case", "communication_case")]
         case_nodes = [self._new_node() for _ in cases]
+        default_idx = next((i for i, c in enumerate(cases) if c.type == "default_case"), None)
         ends = []
-        has_default = False
-        for i, (case, cnode) in enumerate(zip(cases, case_nodes)):
-            self._connect(before, cnode)
-            self._node = cnode
-            self._facts_restore(base)
-            self._scope = self._scope.child()
-            if case.type == "default_case":
-                has_default = True
-            elif case.type == "expression_case":
+        test = self._node
+        for i, case in enumerate(cases):
+            if case.type == "expression_case":
+                self._node = test
                 vals = case.child_by_field_name("value")
                 conds = []
                 for v in (vals.named_children if vals is not None else []):
                     ve = self._lower_expr(v)
                     conds.append(ExpBinOp("==", tag, ve) if tag is not None else ve)
-                if conds:
-                    cond = conds[0]
-                    for c in conds[1:]:
-                        cond = ExpBinOp("||", cond, c)
-                    self._add(Prune(loc=loc, condition=cond, is_true_branch=True,
-                                    kind=PruneKind.SWITCH_CASE))
-            elif case.type == "type_case" and alias is not None and alias.named_children and tag_node is not None:
+                if not conds:
+                    continue
+                cond = conds[0]
+                for c in conds[1:]:
+                    cond = ExpBinOp("||", cond, c)
+                nxt = self._new_node()
+                self._branch(test, cond, case_nodes[i], nxt, loc,
+                             PruneKind.SWITCH_CASE, PruneKind.SWITCH_CASE)
+                test = nxt if test is not None else None
+            elif case.type in ("type_case", "communication_case"):
+                self._connect(test, case_nodes[i])
+        if default_idx is not None:
+            self._connect(test, case_nodes[default_idx])
+        elif node.type != "select_statement":
+            self._connect(test, exit_node)
+            ends.append(base)
+        self._breakables.append(_Breakable(exit_node, None, label))
+        for i, (case, cnode) in enumerate(zip(cases, case_nodes)):
+            self._node = cnode if cnode.preds else None
+            self._facts_restore(base)
+            self._scope = self._scope.child()
+            if case.type == "type_case" and alias is not None and alias.named_children and tag_node is not None:
                 ctype = type_of(case.child_by_field_name("type"), self._src, self._env.imports)
                 aname = self._t(alias.named_children[0])
                 self._scope.declare(aname, ctype)
@@ -2308,9 +2409,6 @@ class GoFrontend:
                 self._connect(self._node, target)
                 if target is exit_node:
                     ends.append(self._facts_snapshot())
-        if not has_default and node.type != "select_statement":
-            self._connect(before, exit_node)
-            ends.append(base)
         self._breakables.pop()
         self._facts_join(ends)
         self._node = exit_node if exit_node.preds else None
@@ -3147,25 +3245,28 @@ FS = '"net/http"\n"os"\n"path/filepath"\n"strings"'
 
 
 def test_fs_twin_base():
-    assert "CWE-22" not in _cwes(_handler('os.Open(filepath.Base(r.FormValue("f")))', FS))
+    _pair("CWE-22", _handler('os.Open(r.FormValue("f"))', FS),
+          _handler('os.Open(filepath.Base(r.FormValue("f")))', FS))
 
 
 def test_fs_twin_securejoin():
-    src = _handler('p, _ := securejoin.SecureJoin("/srv", r.FormValue("f"))\nos.Open(p)',
-                   FS + '\n"github.com/cyphar/filepath-securejoin"')
-    assert "CWE-22" not in _cwes(src)
+    imports = FS + '\n"github.com/cyphar/filepath-securejoin"'
+    _pair("CWE-22", _handler('p := filepath.Join("/srv", r.FormValue("f"))\nos.Open(p)', imports),
+          _handler('p, _ := securejoin.SecureJoin("/srv", r.FormValue("f"))\nos.Open(p)', imports))
 
 
 def test_fs_twin_rooted_clean_join():
-    src = _handler('os.ReadFile(filepath.Join("/srv", filepath.Clean("/" + r.FormValue("f"))))', FS)
-    assert "CWE-22" not in _cwes(src)
+    _pair("CWE-22", _handler('os.ReadFile(filepath.Join("/srv", r.FormValue("f")))', FS),
+          _handler('os.ReadFile(filepath.Join("/srv", filepath.Clean("/" + r.FormValue("f"))))', FS))
 
 
 def test_fs_twin_separator_aware_prefix():
     body = ('p := filepath.Clean(filepath.Join(root, r.FormValue("f")))\n'
             'if !strings.HasPrefix(p, root+string(filepath.Separator)) { return }\n'
             'os.ReadFile(p)')
-    assert "CWE-22" not in _cwes(_handler(body, FS, 'const root = "/srv/www"'))
+    vulnerable = body.replace('if !strings.HasPrefix(p, root+string(filepath.Separator)) { return }\n', '')
+    _pair("CWE-22", _handler(vulnerable, FS, 'const root = "/srv/www"'),
+          _handler(body, FS, 'const root = "/srv/www"'))
 
 
 def test_fs_twin_rel():
@@ -3173,18 +3274,21 @@ def test_fs_twin_rel():
             'rel, err := filepath.Rel(root, p)\n'
             'if err != nil || strings.HasPrefix(rel, "..") { return }\n'
             'os.ReadFile(p)')
-    assert "CWE-22" not in _cwes(_handler(body, FS, 'const root = "/srv/www"'))
+    vulnerable = 'p := filepath.Join(root, r.FormValue("f"))\nos.ReadFile(p)'
+    _pair("CWE-22", _handler(vulnerable, FS, 'const root = "/srv/www"'),
+          _handler(body, FS, 'const root = "/srv/www"'))
 
 
 def test_fs_twin_islocal():
     body = 'f := r.FormValue("f")\nif !filepath.IsLocal(f) { return }\nos.ReadFile(f)'
-    assert "CWE-22" not in _cwes(_handler(body, FS))
+    _pair("CWE-22", _handler('f := r.FormValue("f")\nos.ReadFile(f)', FS), _handler(body, FS))
 
 
 def test_fs_twin_dotdot_free_inside_join():
     body = ('f := r.FormValue("f")\nif strings.Contains(f, "..") { return }\n'
             'os.ReadFile(filepath.Join("/srv", f))')
-    assert "CWE-22" not in _cwes(_handler(body, FS))
+    _pair("CWE-22", _handler('f := r.FormValue("f")\nos.ReadFile(filepath.Join("/srv", f))', FS),
+          _handler(body, FS))
 
 
 def test_fs_twin_receiver_root_assigned_constant():
@@ -3192,7 +3296,8 @@ def test_fs_twin_receiver_root_assigned_constant():
              'func New() *S { return &S{root: "/srv"} }\n'
              'func (s *S) Serve(w http.ResponseWriter, r *http.Request) {\n'
              '  os.ReadFile(filepath.Join(s.root, filepath.Clean("/" + r.FormValue("f"))))\n}')
-    assert "CWE-22" not in _cwes(_handler("", FS, extra))
+    vulnerable = extra.replace('filepath.Clean("/" + r.FormValue("f"))', 'r.FormValue("f")')
+    _pair("CWE-22", _handler("", FS, vulnerable), _handler("", FS, extra))
 
 
 def test_fs_bypass_rooted_clean_alone():
@@ -3234,25 +3339,29 @@ def test_redirect_twin_relative_path_full_check():
             'if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || '
             'strings.Contains(next, "\\\\") || strings.ContainsAny(next, "\\r\\n\\t") { return }\n'
             'http.Redirect(w, r, next, 302)')
-    assert "CWE-601" not in _cwes(_handler(body, RD))
+    _pair("CWE-601", _handler('next := r.FormValue("next")\nhttp.Redirect(w, r, next, 302)', RD),
+          _handler(body, RD))
 
 
 def test_redirect_twin_url_parse_full_check():
     body = ('next := r.FormValue("next")\nu, err := url.Parse(next)\n'
             'if err != nil || u.IsAbs() || u.Host != "" || strings.Contains(next, "\\\\") { return }\n'
             'http.Redirect(w, r, next, 302)')
-    assert "CWE-601" not in _cwes(_handler(body, RD))
+    vulnerable = 'next := r.FormValue("next")\nu, _ := url.Parse(next)\n_ = u\nhttp.Redirect(w, r, next, 302)'
+    _pair("CWE-601", _handler(vulnerable, RD), _handler(body, RD))
 
 
 def test_redirect_twin_host_allowlist():
     body = ('u, err := url.Parse(r.FormValue("next"))\n'
             'if err != nil || u.Hostname() != "example.com" { return }\n'
             'http.Redirect(w, r, u.String(), 302)')
-    assert "CWE-601" not in _cwes(_handler(body, RD))
+    vulnerable = body.replace('if err != nil || u.Hostname() != "example.com" { return }\n', '_ = err\n')
+    _pair("CWE-601", _handler(vulnerable, RD), _handler(body, RD))
 
 
 def test_redirect_twin_constant_prefix_with_query():
-    assert "CWE-601" not in _cwes(_handler('http.Redirect(w, r, "/search?q="+r.FormValue("q"), 302)', RD))
+    _pair("CWE-601", _handler('http.Redirect(w, r, r.FormValue("q"), 302)', RD),
+          _handler('http.Redirect(w, r, "/search?q="+r.FormValue("q"), 302)', RD))
 
 
 def test_redirect_bypass_isabs_only():
@@ -3292,14 +3401,15 @@ def test_redirect_bypass_constant_path_prefix():
 
 # ---- CWE-918 ------------------------------------------------------------------------
 def test_ssrf_twin_constant_authority():
-    src = _handler('http.Get("https://api.example.com/v1/items?id=" + r.FormValue("id"))', RD)
-    assert "CWE-918" not in _cwes(src)
+    _pair("CWE-918", _handler('http.Get(r.FormValue("id"))', RD),
+          _handler('http.Get("https://api.example.com/v1/items?id=" + r.FormValue("id"))', RD))
 
 
 def test_ssrf_twin_host_allowlist():
     body = ('u, err := url.Parse(r.FormValue("u"))\n'
             'if err != nil || u.Hostname() != "api.example.com" { return }\nhttp.Get(u.String())')
-    assert "CWE-918" not in _cwes(_handler(body, RD))
+    vulnerable = body.replace('if err != nil || u.Hostname() != "api.example.com" { return }\n', '_ = err\n')
+    _pair("CWE-918", _handler(vulnerable, RD), _handler(body, RD))
 
 
 def test_ssrf_bypass_query_escaped_host():
@@ -3316,7 +3426,8 @@ HT = '"html"\n"html/template"\n"net/http"'
 
 
 def test_html_twin_escaped():
-    assert "CWE-79" not in _cwes(_handler('_ = template.HTML(html.EscapeString(r.FormValue("x")))', HT))
+    _pair("CWE-79", _handler('_ = template.HTML(r.FormValue("x"))', HT),
+          _handler('_ = template.HTML(html.EscapeString(r.FormValue("x")))', HT))
 
 
 def test_html_bypass_unescaped():
@@ -3330,7 +3441,9 @@ def test_template_js_is_out_of_scope():
 def test_alloc_twin_bounded():
     body = ('n, _ := strconv.Atoi(r.FormValue("n"))\nif n > 1048576 { return }\n'
             'buf := make([]byte, n)\n_ = buf')
-    assert "CWE-770" not in _cwes(_handler(body, '"net/http"\n"strconv"'))
+    imports = '"net/http"\n"strconv"'
+    _pair("CWE-770", _handler(body.replace('if n > 1048576 { return }\n', ''), imports),
+          _handler(body, imports))
 ```
 
 - [ ] **Step 2: Write the failing unit tests**
@@ -4484,15 +4597,22 @@ The Go frontend targets the taint-shaped and CWE-770 Go tasks (about 45 plus
 the CWE-770 slice of 44 resource tasks); the rest of the Go set stays LLM-only.
 Measure it in three runs over the same task ids:
 
+`run.py` launches `sys.executable -m frame.sil.cli` with the extracted snapshot
+as its working directory and discards stdout, so a wrong interpreter or a
+missing `PYTHONPATH` makes every scan fail silently and look like "no
+findings". Always run it with an interpreter that has tree-sitter, and point
+`PYTHONPATH` at the checkout being measured:
+
 ```bash
-IDS=$(python benchmarks/vloc/go_subset.py --workspace "$WS" --extra 20)
-# 1. LLM-only baseline, on a checkout of main from BEFORE the Go frontend
-python benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/go-baseline" --only "$IDS"
+PY=/path/to/frame/.venv/bin/python
+IDS=$($PY benchmarks/vloc/go_subset.py --workspace "$WS" --extra 20)
+# 1. LLM-only baseline: a checkout of main from BEFORE the Go frontend
+(cd ../frame-main && PYTHONPATH=$PWD $PY benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/go-baseline" --only "$IDS")
 # 2. symbolic only, this branch (baseline: zero findings, TNR 1.0)
-python benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/go-symbolic" --only "$IDS" --no-ai
+PYTHONPATH=$PWD $PY benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/go-symbolic" --only "$IDS" --no-ai
 # 3. symbolic + LLM, this branch
-python benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/go-ai" --only "$IDS"
-python benchmarks/vloc/score.py --workspace "$WS" --results "$OUT/go-symbolic"
+PYTHONPATH=$PWD $PY benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/go-ai" --only "$IDS"
+$PY benchmarks/vloc/score.py --workspace "$WS" --results "$OUT/go-symbolic"
 ```
 
 Every Phase B finding in run 2 is a false positive on patched code; triage
@@ -4522,31 +4642,56 @@ Do nothing further in this task until the user answers.
 
 - [ ] **Step 5: Timing probe (after approval)**
 
+`run.py` runs the scanner as `sys.executable -m frame.sil.cli` from inside the snapshot directory and discards its stdout. Bare `python` on this machine is `/usr/bin/python`, which has no tree-sitter, and without `PYTHONPATH` the snapshot directory cannot import `frame` at all. Either mistake makes every scan fail silently and look like "no findings". So pin the interpreter and the checkout, and verify both before trusting any number:
+
 ```bash
 export WS=/tmp/frame-vloc OUT=/tmp/vloc-results
-python benchmarks/vloc/prepare.py --workspace "$WS" --sample <N from the user>
-K8S=$(python - <<'EOF'
-import csv, os
-rows = csv.DictReader(open(os.path.join(os.environ["WS"], "manifest_subset.csv")))
-print(next(r["alpha_id"] for r in rows if r["repo_full_name"] == "kubernetes/kubernetes"))
-EOF
-)
-time python benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/probe" --only "$K8S" --phases a --no-ai
+export PY="$PWD/.venv/bin/python" PYTHONPATH="$PWD"
+(cd /tmp && $PY -c "import frame, frame.sil.frontends as f; print(frame.__file__, getattr(f, 'GO_FRONTEND_AVAILABLE', 'absent'))")
 ```
 
-Report wall-clock time and, from the JSON output, files scanned versus skipped. If no kubernetes task is in the sample, pick the largest Go repository in it by `vulnerable_unzip_kb`.
+Expected: a path inside this worktree and `True`. Then:
+
+```bash
+$PY benchmarks/vloc/prepare.py --workspace "$WS" --sample <N from the user>
+K8S=$($PY -c '
+import csv, os
+rows = list(csv.DictReader(open(os.path.join(os.environ["WS"], "manifest_subset.csv"))))
+go = [r for r in rows if r["ecosystem"].lower() == "go"]
+k8s = [r for r in go if r["repo_full_name"] == "kubernetes/kubernetes"]
+pick = k8s[0] if k8s else max(go, key=lambda r: float(r["vulnerable_unzip_kb"] or 0))
+print(pick["alpha_id"])')
+time $PY benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/probe" --only "$K8S" --phases a --no-ai
+$PY -c '
+import glob, json, os, sys
+files = glob.glob(os.path.join(os.environ["OUT"], "probe", "*_phase_a.json"))
+if not files:
+    sys.exit("probe produced no output JSON: the scan did not run")
+data = json.load(open(files[0]))
+errors = data.get("errors") or []
+print(json.dumps({k: data[k] for k in data if k != "findings"}, indent=1)[:2000])
+if errors:
+    sys.exit("probe reported errors: %s" % errors[:3])'
+```
+
+Report the wall-clock time and the files scanned versus skipped. Any exit from the checker above is a failed probe. Do not proceed to Step 6 until it passes.
 
 - [ ] **Step 6: Baseline on main (after approval)**
 
 ```bash
 git worktree add ../frame-main main
-cd ../frame-main && python benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/go-baseline" --only "$IDS"
-cd - && git worktree remove ../frame-main
+IDS=$($PY benchmarks/vloc/go_subset.py --workspace "$WS" --extra 20)
+(cd ../frame-main && export PYTHONPATH="$PWD" \
+  && (cd /tmp && $PY -c "import frame, frame.sil.frontends as f; print(frame.__file__, getattr(f, 'GO_FRONTEND_AVAILABLE', 'absent'))") \
+  && $PY benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/go-baseline" --only "$IDS")
+git worktree remove ../frame-main
 ```
+
+The check line must print a path inside `../frame-main` and `absent`: that is the proof the baseline ran without the Go frontend. Any other output means stop.
 
 - [ ] **Step 7: Branch runs and report**
 
-Run runs 2 and 3 from the README section, score all three, and report File F1 and TNR for the target subset and for the whole sampled Go set, plus the triage of every Phase B finding from run 2. Record the numbers in `benchmarks/vloc/README.md` under the Go measurement section and commit:
+With `PYTHONPATH="$PWD"` exported in this worktree (re-run the Step 5 check: this worktree's path and `True`), run runs 2 and 3 from the README section, then score all three, and report File F1 and TNR for the target subset and for the whole sampled Go set, plus the triage of every Phase B finding from run 2. Record the numbers in `benchmarks/vloc/README.md` under the Go measurement section and commit:
 
 ```bash
 git add benchmarks/vloc/README.md
