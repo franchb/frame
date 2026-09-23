@@ -5,6 +5,7 @@ from tree_sitter import Language, Parser
 
 from frame.sil.frontends._go_env import (
     GoType, UNKNOWN, Scope, build_file_env, canonical_pkg, default_package_name,
+    literal_value,
 )
 
 _PARSER = Parser(Language(tsgo.language()))
@@ -101,3 +102,20 @@ def test_scope_shadowing():
 
 def test_unknown_type_is_unknown():
     assert not UNKNOWN.known
+
+
+def _string_literals(node):
+    if node.type == "interpreted_string_literal":
+        yield node
+    for child in node.named_children:
+        yield from _string_literals(child)
+
+
+def test_string_literal_round_trips_escapes_and_non_ascii():
+    src = 'package main\n\nconst greeting = "héllo 日本"\nconst tabbed = "a\\tb"\n'
+    data = src.encode()
+    root = _PARSER.parse(data).root_node
+    nodes = list(_string_literals(root))
+    assert len(nodes) == 2
+    assert literal_value(nodes[0], data) == "héllo 日本"
+    assert literal_value(nodes[1], data) == "a\tb"

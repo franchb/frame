@@ -8,7 +8,6 @@ single parse yields package-qualified names without a Go toolchain:
 guess, because a wrong guess becomes a wrong spec and a false finding.
 """
 
-import codecs
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -110,7 +109,7 @@ def literal_value(node, src: bytes):
     if t == "interpreted_string_literal":
         body = raw[1:-1]
         try:
-            return codecs.decode(body, "unicode_escape")
+            return body.encode("latin-1", "backslashreplace").decode("unicode_escape")
         except (UnicodeDecodeError, ValueError):
             return body
     if t == "raw_string_literal":
