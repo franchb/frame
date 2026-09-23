@@ -34,6 +34,10 @@ def _strip(node):
 # --------------------------------------------------------------------------- trust
 _FUNC_TYPES = ("function_declaration", "method_declaration", "func_literal")
 _TRUSTED_LITERAL_TYPES = ("slice_type", "array_type", "implicit_length_array_type", "map_type")
+# Calls that only read a container argument, so passing it is not an escape.
+_READ_ONLY_CALLS = frozenset({
+    "slices.Contains", "slices.Index", "slices.ContainsFunc", "slices.IndexFunc",
+    "maps.Keys", "maps.Values"})
 
 
 def _enclosing_fn(node):
@@ -75,6 +79,7 @@ class TrustOracle:
         self.field_assign: Dict[str, List] = {}      # "*": a write to any field
         self.escaped_names: Set[str] = set()
         self.escaped_fields: Set[str] = set()
+        self.passed_names: Set[str] = set()          # bare call arguments
         self.frames: List[_Frame] = []
         self._frame_cache: Dict[Tuple[int, int], _Frame] = {}
         self._collect(root)
@@ -84,19 +89,41 @@ class TrustOracle:
         lnode = _strip(lnode)
         if lnode is None:
             return
+        # `m[k] = v` writes both k and v into m: every index on the path is a
+        # written value too.
+        written = [rnode]
+        fields: List[str] = []
         node = lnode
         while node is not None and node.type in ("selector_expression", "index_expression",
                                                  "parenthesized_expression", "unary_expression"):
             if node.type == "selector_expression":
-                self.field_assign.setdefault(
-                    self.text(node.child_by_field_name("field")), []).append((rnode, fn))
+                fields.append(self.text(node.child_by_field_name("field")))
+            elif node.type == "index_expression":
+                written.append(node.child_by_field_name("index"))
             node = (node.child_by_field_name("operand") if node.type != "parenthesized_expression"
                     else (node.named_children[0] if node.named_children else None))
+        for f in fields:
+            self.field_assign.setdefault(f, []).extend((w, fn) for w in written)
         if node is not None and node.type == "identifier":
             name = self.text(node)
             if name in self.env.package_vars:
                 # `v = x`, `v[k] = x` and `v.f = x` all change what v holds.
-                self.pkg_assign.setdefault(name, []).append((rnode, fn))
+                self.pkg_assign.setdefault(name, []).extend((w, fn) for w in written)
+
+    def _record_call_args(self, call) -> None:
+        """A map or slice is a reference: passing it bare to a call lets the
+        callee write into it (`maps.Copy(dst, ...)`), so it escapes like `&x`.
+        Recorded by name; `_trusted_name` applies it to containers only."""
+        if self.key_of(call) in _READ_ONLY_CALLS:
+            return
+        fn = call.child_by_field_name("function")
+        if fn is not None and fn.type == "identifier" and self.text(fn) in ("len", "cap"):
+            return
+        args = call.child_by_field_name("arguments")
+        for a in (args.named_children if args is not None else []):
+            a = _strip(a)
+            if a is not None and a.type == "identifier":
+                self.passed_names.add(self.text(a))
 
     def _record_escape(self, operand) -> None:
         node = _strip(operand)
@@ -111,22 +138,60 @@ class TrustOracle:
         if node is not None and node.type == "identifier":
             self.escaped_names.add(self.text(node))
 
-    def _record_positional(self, lit, fn) -> None:
-        type_node = lit.child_by_field_name("type")
-        body = lit.child_by_field_name("body")
-        if type_node is None or body is None or type_node.type in _TRUSTED_LITERAL_TYPES:
-            return
+    def _struct_fields_of(self, type_node) -> Optional[List[str]]:
+        """Field names of a same-file struct type (through `*T`); ["*"] for a
+        qualified or generic type; None for anything else."""
+        if type_node is not None and type_node.type == "pointer_type" and type_node.named_children:
+            type_node = type_node.named_children[0]
+        if type_node is None:
+            return None
+        if type_node.type == "type_identifier":
+            name = self.text(type_node)
+            return list(self.env.struct_fields[name]) if name in self.env.struct_fields else None
+        if type_node.type in ("qualified_type", "generic_type"):
+            return ["*"]
+        return None
+
+    def _record_struct_body(self, fields: List[str], body, fn) -> None:
         elems = [_elem_expr(e) for e in body.named_children
                  if e.type not in ("keyed_element", "comment")]
-        if not elems:
-            return
-        if type_node.type == "type_identifier" and self.text(type_node) not in self.env.struct_fields:
-            return                                  # a local non-struct type
-        fields = (list(self.env.struct_fields[self.text(type_node)])
-                  if type_node.type == "type_identifier" else ["*"])
         for f in fields:
             for e in elems:
                 self.field_assign.setdefault(f, []).append((e, fn))
+
+    def _record_elided(self, type_node, body, fn) -> None:
+        """Elements of a slice / array / map literal whose type is elided
+        (`[]S{{x}}`, `map[string]*S{"a": {x}}`) are literals of the element type."""
+        if type_node is None or body is None:
+            return
+        if type_node.type in ("slice_type", "array_type", "implicit_length_array_type"):
+            elem_type = type_node.child_by_field_name("element")
+        elif type_node.type == "map_type":
+            elem_type = type_node.child_by_field_name("value")
+        else:
+            return
+        for e in body.named_children:
+            value = e.named_children[-1] if e.type == "keyed_element" and e.named_children else e
+            inner = _elem_expr(value)
+            if inner is None or inner.type != "literal_value":
+                continue
+            fields = self._struct_fields_of(elem_type)
+            if fields is not None:
+                self._record_struct_body(fields, inner, fn)
+            else:
+                self._record_elided(elem_type, inner, fn)
+
+    def _record_positional(self, lit, fn) -> None:
+        type_node = lit.child_by_field_name("type")
+        body = lit.child_by_field_name("body")
+        if type_node is None or body is None:
+            return
+        if type_node.type in _TRUSTED_LITERAL_TYPES:
+            self._record_elided(type_node, body, fn)
+            return
+        fields = self._struct_fields_of(type_node)
+        if fields is not None:
+            self._record_struct_body(fields, body, fn)
 
     def _collect(self, root) -> None:
         stack = [root]
@@ -147,6 +212,8 @@ class TrustOracle:
                     self._record_escape(n.child_by_field_name("operand"))
             elif n.type == "composite_literal":
                 self._record_positional(n, _enclosing_fn(n))
+            elif n.type == "call_expression":
+                self._record_call_args(n)
             elif n.type == "keyed_element":
                 kids = n.named_children
                 if len(kids) >= 2:
@@ -185,11 +252,15 @@ class TrustOracle:
                 for i, l in enumerate(ls):
                     rhs = rs[i] if len(rs) == len(ls) else None
                     base = _strip(l)
+                    indexes = []
                     while base is not None and base.type in ("selector_expression", "index_expression",
                                                              "unary_expression"):
+                        if base.type == "index_expression":
+                            indexes.append(base.child_by_field_name("index"))
                         base = _strip(base.child_by_field_name("operand"))
                     if base is not None and base.type == "identifier":
-                        defs.setdefault(self.text(base), []).append(rhs)
+                        # `m[k] = v` writes k as well as v into m.
+                        defs.setdefault(self.text(base), []).extend([rhs] + indexes)
             elif n.type in ("var_spec", "const_spec"):
                 values = n.child_by_field_name("value")
                 vals = values.named_children if values is not None else []
@@ -283,8 +354,32 @@ class TrustOracle:
                     return False
         return True
 
+    def _is_container(self, name: str, frame) -> bool:
+        """Is `name` a map / slice / array (a reference a callee can write into)?"""
+        typ = self.env.package_vars.get(name)
+        if typ is not None and typ.path.startswith(("[", "map[")):
+            return True
+        rhs_nodes = list(frame.defs.get(name, [])) if frame is not None and name in frame.defs \
+            else [r for r, _ in self.pkg_assign.get(name, [])]
+        for rhs in rhs_nodes:
+            node = _strip(rhs) if rhs not in (None, "zero") else None
+            if node is None:
+                continue
+            if node.type == "composite_literal":
+                t = node.child_by_field_name("type")
+                if t is not None and t.type in _TRUSTED_LITERAL_TYPES:
+                    return True
+            if node.type == "call_expression":
+                fn = node.child_by_field_name("function")
+                if fn is not None and fn.type == "identifier" and self.text(fn) in ("make", "append"):
+                    return True
+        return False
+
     def _trusted_name(self, name: str, checked, seen) -> bool:
         if name == checked or name in self.escaped_names:
+            return False
+        frame = self.frames[-1] if self.frames else None
+        if name in self.passed_names and self._is_container(name, frame):
             return False
         if self.frames:
             frame = self.frames[-1]

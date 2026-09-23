@@ -115,7 +115,11 @@ def literal_value(node, src: bytes):
     if t == "raw_string_literal":
         return raw[1:-1]
     if t == "rune_literal":
-        return raw[1:-1]
+        body = raw[1:-1]                    # '\\' is one backslash, as in a string
+        try:
+            return body.encode("latin-1", "backslashreplace").decode("unicode_escape")
+        except (UnicodeDecodeError, ValueError):
+            return body
     if t == "int_literal":
         try:
             return int(raw.replace("_", ""), 0)

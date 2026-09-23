@@ -587,3 +587,68 @@ def test_redirect_twin_relative_path_with_url_parse_error_for_control_chars():
     # Without the url.Parse error rejection the control-character part is missing.
     partial = body.replace('err != nil || ', '').replace('_, err := url.Parse(next)\n', '')
     _pair("CWE-601", _handler(partial, RD), _handler(body, RD))
+
+
+# ---- Fix round 2: container writes, elided struct literals, rune needles ---------------
+MAP_GUARD = ('u, err := url.Parse(r.FormValue("next"))\nif err != nil || !allowed[u.Hostname()] { return }\n'
+             'http.Redirect(w, r, u.String(), 302)')
+ALLOWED = 'var allowed = map[string]bool{"example.com": true}'
+
+
+def test_redirect_bypass_map_key_written_in_other_function():
+    extra = ALLOWED + '\nfunc add(w http.ResponseWriter, r *http.Request) { allowed[r.FormValue("h")] = true }'
+    assert "CWE-601" in _cwes(_handler(MAP_GUARD, RD, extra))
+
+
+def test_redirect_bypass_local_map_key_written():
+    body = 'allowed := map[string]bool{"example.com": true}\nallowed[r.FormValue("h")] = true\n' + MAP_GUARD
+    assert "CWE-601" in _cwes(_handler(body, RD))
+
+
+def test_redirect_bypass_map_filled_by_callee():
+    extra = (ALLOWED + '\nfunc add(w http.ResponseWriter, r *http.Request) '
+             '{ maps.Copy(allowed, map[string]bool{r.FormValue("h"): true}) }')
+    assert "CWE-601" in _cwes(_handler(MAP_GUARD, RD + '\n"maps"', extra))
+
+
+def test_redirect_bypass_map_keys_from_range_over_request():
+    extra = (ALLOWED + '\nfunc add(w http.ResponseWriter, r *http.Request) '
+             '{ for _, h := range r.Form["h"] { allowed[h] = true } }')
+    assert "CWE-601" in _cwes(_handler(MAP_GUARD, RD, extra))
+
+
+def test_ssrf_twin_named_slice_allowlist():
+    # slices.Contains only reads its argument: passing HOSTS is not a write.
+    body = ('u, err := url.Parse(r.FormValue("u"))\n'
+            'if err != nil || !slices.Contains(HOSTS, u.Hostname()) { return }\nhttp.Get(u.String())')
+    imports = RD + '\n"slices"'
+    extra = 'var HOSTS = []string{"api.example.com"}'
+    tainted = extra + '\nfunc add(w http.ResponseWriter, r *http.Request) { HOSTS = append(HOSTS, r.FormValue("h")) }'
+    _pair("CWE-918", _handler(body, imports, tainted), _handler(body, imports, extra))
+
+
+_SERVE_ROOT = ('type S struct{ root string }\n'
+               'func (s *S) Serve(w http.ResponseWriter, r *http.Request) {\n'
+               '  os.ReadFile(filepath.Join(s.root, filepath.Clean("/" + r.FormValue("f"))))\n}\n')
+
+
+def test_fs_bypass_elided_positional_struct_in_slice():
+    extra = _SERVE_ROOT + ('func mk(w http.ResponseWriter, r *http.Request) '
+                           '{ ts := []S{{r.FormValue("root")}}; ts[0].Serve(w, r) }')
+    assert "CWE-22" in _cwes(_handler("", FS, extra))
+
+
+def test_fs_bypass_elided_positional_struct_in_map():
+    extra = _SERVE_ROOT + ('func mk(w http.ResponseWriter, r *http.Request) '
+                           '{ ts := map[string]*S{"a": {r.FormValue("root")}}; ts["a"].Serve(w, r) }')
+    assert "CWE-22" in _cwes(_handler("", FS, extra))
+
+
+def test_redirect_twin_containsrune_backslash():
+    body = ('next := r.FormValue("next")\n'
+            'if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || '
+            "strings.ContainsRune(next, '\\\\') || strings.ContainsAny(next, \"\\r\\n\\t\") { return }\n"
+            'http.Redirect(w, r, next, 302)')
+    # A rune other than backslash does not prove the absence of backslashes.
+    partial = body.replace("'\\\\'", "'x'")
+    _pair("CWE-601", _handler(partial, RD), _handler(body, RD))
