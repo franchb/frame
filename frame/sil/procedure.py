@@ -435,6 +435,11 @@ class Program:
     # JavaScript, which require `self.` / `this.` for a method call.
     language: str = ""
 
+    # Set by frontends that resolve call names before lookup (Go). A miss is
+    # then a miss: no suffix, type-prefix or bare-method fallback, which would
+    # let an unresolved `x.Query` borrow another type's spec.
+    exact_spec_lookup: bool = False
+
     def __str__(self) -> str:
         lines = [f"Program with {len(self.procedures)} procedures:"]
         for name in self.procedures:
@@ -478,6 +483,9 @@ class Program:
         spec = self.library_specs.get(func_name)
         if spec:
             return spec
+
+        if self.exact_spec_lookup:
+            return None
 
         # For method calls like "var.method", try matching just the method name
         # This handles cases like "__nested_4.decode" matching "str.decode" or "bytes.decode"

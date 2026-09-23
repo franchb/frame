@@ -863,6 +863,12 @@ class SILTranslator:
         return (getattr(self.program, "language", "") or "").lower() in (
             "c", "cpp", "c++", "cxx")
 
+    @property
+    def _is_go_lang(self) -> bool:
+        """The Go frontend owns path termination and resolves every call name
+        itself; a few shared behaviours are switched for it."""
+        return (getattr(self.program, "language", "") or "").lower() == "go"
+
     def _proc_always_returns_constant(self, proc_name: str) -> bool:
         """
         Check if a procedure always returns a constant value.
@@ -1501,8 +1507,11 @@ class SILTranslator:
         numeric_checks += self._tainted_index_checks(instr, state, proc_name)
 
         if isinstance(instr, Assign):
+            go_rhs = self._go_assign_rhs(instr, state) if self._is_go_lang else None
             assign_checks, state = self._exec_assign(instr, state, proc_name)
             checks.extend(assign_checks)
+            if go_rhs is not None:
+                self._go_settle_assign(instr, state, go_rhs)
 
         elif isinstance(instr, Load):
             checks, state = self._exec_load(instr, state, proc_name)
@@ -1929,6 +1938,35 @@ class SILTranslator:
                     checks.append(check)
 
         return checks, state
+
+    def _go_assign_rhs(self, instr: Assign, state: SymbolicState):
+        """Go: the taint and sanitization an assignment's right-hand side
+        carries, read BEFORE the assignment runs, so `p = p + y` sees old p."""
+        tainted = [v for v in self._get_exp_vars(instr.exp) if state.is_tainted(v)]
+        if not tainted:
+            return (None, set())
+        kinds = set(state.sanitized.get(tainted[0], []))
+        for v in tainted[1:]:
+            kinds &= set(state.sanitized.get(v, []))
+        return (state.get_taint_info(tainted[0]), kinds)
+
+    def _go_settle_assign(self, instr: Assign, state: SymbolicState, rhs) -> None:
+        """Go: an assignment REPLACES the target's value. The shared
+        _exec_assign only adds taint and unions sanitization, which would leave
+        a sanitized-then-reassigned variable looking clean (a missed finding)
+        and a reassigned-to-constant variable looking tainted."""
+        target = self._get_var_name(instr.id)
+        info, kinds = rhs
+        if info is None:
+            state.tainted.pop(target, None)
+            state.sanitized.pop(target, None)
+            return
+        if target not in state.tainted:
+            state.tainted[target] = info
+        if kinds:
+            state.sanitized[target] = sorted(kinds)
+        else:
+            state.sanitized.pop(target, None)
 
     def _exec_load(
         self,
@@ -2979,6 +3017,19 @@ class SILTranslator:
         # Try constant folding: evaluate condition with known constants
         cond_str = str(instr.condition)
         eval_result = state.try_eval_expr(cond_str)
+
+        # Go: a literal `if true { ... }` / `if false { ... }` condition is a
+        # bare boolean constant, not a comparison or a tracked variable, so
+        # the string-based evaluator above never folds it (it only matches
+        # numeric/quoted-string patterns). Fold it structurally from the
+        # ExpConst itself instead of teaching the string evaluator to match
+        # 'true'/'false' text, which would also fire on other frontends'
+        # structural `True` placeholder edges (e.g. loop back-edges) that
+        # carry no real condition. Gated to Go so other languages keep
+        # exactly their current behaviour.
+        if eval_result is None and self._is_go_lang and isinstance(instr.condition, ExpConst) \
+                and isinstance(instr.condition.value, bool):
+            eval_result = instr.condition.value
 
         if eval_result is not None:
             # Condition can be fully evaluated
@@ -4392,6 +4443,11 @@ class SILTranslator:
 
     def _is_noreturn_call(self, instr: Instr) -> bool:
         """Is `instr` a call to a function that never returns (exit/abort/...)?"""
+        # Go termination is structural (the frontend ends the path after
+        # panic/os.Exit/log.Fatal*). The C names below (`exit`, `err`) are
+        # ordinary Go identifiers and must not cut a Go path.
+        if self._is_go_lang:
+            return False
         if not isinstance(instr, Call):
             return False
         name = instr.get_func_name() if hasattr(instr, "get_func_name") else None
