@@ -1,7 +1,7 @@
 # Go symbolic frontend (taint + CWE-770): design
 
 Date: 2026-09-23
-Status: revised after written-spec review (rev 2), pending re-review
+Status: revised after written-spec review (rev 4), pending re-review
 
 ## Goal
 
@@ -110,29 +110,41 @@ unrelated `x.Query` match through the `connection` prefix. Therefore:
    `library_specs` hit, else `None`. No suffix, prefix or bare-name fallback.
    The Go frontend sets it to `True`.
 2. The Go program's `library_specs` does **not** contain `GO_SPECS`. It contains
-   only the specs the frontend resolved for calls in this file, registered under
-   the exact emitted name.
-3. The frontend resolves each call against `GO_SPECS` using the import and type
-   tables, yielding a package-qualified key such as `database/sql.DB.Query`,
-   emits the `Call` with a `recv.Method` function name (this shape keeps the
-   translator's receiver → return propagation working), and registers the
-   resolved `ProcSpec` under that name.
-4. If the same emitted name resolves to different specs within one file, the
-   frontend registers nothing for it (abstains): the call gets default
-   propagation and no sink.
-5. An unresolved call is never registered, so with exact lookup it cannot match
-   any spec. It gets the translator's default unknown-call propagation
-   (arguments and receiver taint the result).
-6. Same-file procedures are looked up the same way. `_exec_call` looks specs up
-   by `Call.get_full_name()`, which for a method call is the emitted `s.H`, not
-   the procedure name `Server.H`. So the frontend resolves same-file method and
-   function calls through the type environment and registers the callee's
-   summary spec (see Same-file interprocedural flow) in `library_specs` under
-   exactly the call's `get_full_name()`, with the same abstain-on-conflict rule.
-   The into-callee fixpoint uses the same resolution.
+   only the specs the frontend resolved for call sites in this file.
+3. **Registered names are unique per call site, so a registration can never
+   match another call.** A file-global name such as `x.Query` is unsafe even with
+   conflict detection: one function's `x` may be a `*sql.DB` that resolves while
+   another function's `x` has an unsupported external type that does not, and
+   both calls would share the registration. So:
+   - **Resolved method call** (`db.Query(q)` with `db` typed `*sql.DB`): the
+     frontend emits `Assign $rN = db` into a fresh site-unique temp, then the
+     `Call` with function name `$rN.Query`, and registers the resolved
+     `ProcSpec` under `$rN.Query`. The `recv.Method` shape keeps the
+     translator's receiver → return propagation working, and `$rN` carries
+     `db`'s taint through the `Assign`.
+   - **Resolved package function** (`exec.Command(x)`, `osexec.Command(x)`):
+     emitted and registered under a canonical name in a reserved namespace,
+     `go:os/exec.Command`. The `go:` prefix cannot come from Go source.
+   - **Same-file function** `F`: the procedure is named `go:F`, and calls that
+     resolve to it are emitted as `go:F`, so `get_spec` finds the procedure's
+     own summary spec directly. **Same-file method** `Server.H`: the procedure
+     is named `go:Server.H`; a call `s.H(x)` that resolves to it is emitted as
+     `$rN.H` through a site-unique temp, with the callee's summary registered
+     under `$rN.H`. The name `_exec_call` looks up (`Call.get_full_name()`) is
+     therefore always the registered key.
+   - **Unresolved call:** emitted under its source text (`x.Query`, `F` through
+     a shadowing local). Source text never starts with `$` or `go:`, so with
+     exact lookup it cannot equal any registered key or procedure name. It gets
+     the translator's default unknown-call propagation (arguments and receiver
+     taint the result) and no sink.
+4. Because every key is site-unique or canonical, no conflict detection is
+   needed. The into-callee fixpoint uses the same resolution.
 
 Tests: `x.Repeat(n)` on a non-`bytes`/`strings` receiver and `x.Query(s)` on a
 non-SQL receiver in the same file as a resolved SQL call both produce no sink;
+two functions that each call `x.Query(s)`, one with `x` typed `*sql.DB` and one
+with `x` of an unsupported external type, produce exactly one CWE-89 finding
+(in the first);
 for a same-file method call `s.H(x)`, `program.get_spec(instr.get_full_name())`
 returns `Server.H`'s summary.
 
@@ -168,8 +180,9 @@ Follows the Java/Python frontends' conventions; Go-specific decisions below.
 
 ### Procedures
 
-- `func F` → procedure `F`. `func (s *Server) H` → procedure `Server.H`, receiver
-  is param 0 with its declared type.
+- `func F` → procedure `go:F`. `func (s *Server) H` → procedure `go:Server.H`,
+  receiver is param 0 with its declared type. The `go:` namespace is explained
+  in Spec resolution.
 - Function literals become their own procedures, named `Outer$func1`,
   `Outer$func2`, ... in source order. In the enclosing procedure the literal is a
   function-value constant. Handler registrations such as
@@ -249,9 +262,10 @@ detector:
   and `for { select { ... } }` worker loops are idiomatic Go, and
   `loop_exit.py`'s exit set does not cover Go's `panic` / `os.Exit` calls.
   Fixture: a daemon accept loop stays silent.
-- **CWE-674 (uncontrolled recursion):** left on. Go is outside
-  `_IMPLICIT_RECEIVER_LANGUAGES`, so a method self-call is recognised only when
-  qualified; the detector abstains otherwise. Fixtures: a recursive function
+- **CWE-674 (uncontrolled recursion):** left on. A self-call to a function
+  `F` is emitted as `go:F` inside procedure `go:F`, so it is recognised. A
+  method self-call is emitted through a site-unique `$rN.H` temp and is not
+  recognised, so the detector abstains on method recursion (recall loss only). Fixtures: a recursive function
   with a base case stays silent; one without fires.
 - **Hardcoded-secret literal scan:** left on (it is language-agnostic by
   design). Fixtures: a credential-shaped `const` fires; an ordinary string
@@ -425,8 +439,14 @@ prefix fixes the destination, the frontend does not emit the sink:
 - `SSRF`: the constant prefix contains `scheme://host/`, with the authority
   terminated by `/` before any non-constant part (`"https://api.example/v1?q=" + x`
   is fixed; `"https://" + x` and `"https://api.example" + x` are not).
-- `REDIRECT`: the constant prefix starts with `/` followed by a character that is
-  neither `/` nor `\` (`"/search?q=" + x` is fixed; `"/" + x` is not).
+- `REDIRECT`: the constant prefix starts with `/` followed by a character that
+  is neither `/` nor `\`, **and** contains a `?` before the non-constant part
+  (`"/search?q=" + x` is fixed). A constant path prefix alone is not enough:
+  `http.Redirect` path-cleans a relative destination, so `"/safe/" + x` with
+  `x = "../\\evil.example"` becomes `Location: /\evil.example`, which browsers
+  resolve to an external host (reproduced with `httptest` on Go 1.27.1). The
+  query is not cleaned, so a `?` in the constant part pins the path. A `#` does
+  not help (`"/p#/../\\evil"` also becomes `/\evil`).
 
 A prefix reached through an intermediate variable is not recognised in this
 milestone (recall loss, not a precision loss).
@@ -447,13 +467,27 @@ complete rule for a kind.
   result of `filepath.Clean`, `filepath.Abs` or `filepath.Join` (which cleans), or
   the `path` equivalents.
 - **Trusted (untainted) root or allowlist:** lowering runs before taint
-  analysis, so "untainted" is decided syntactically. An expression is trusted
-  if it is a constant, a package-level identifier, a receiver field (`s.root`),
-  or a local whose definitions do not syntactically reference a source-typed
-  parameter, a `library_mode`-tainted parameter, or the variable being checked.
-  Anything else is untrusted and the rule does not apply (recall loss, not
-  precision loss). This definition is used by every "root" and "allowlist"
-  below and by the Join/Clean return-value sanitizer.
+  analysis, so trust is decided from in-file reaching definitions, never from
+  the storage location alone. An expression is trusted if it is:
+  - a constant (literal or `const`);
+  - a local whose every reaching definition is trusted;
+  - a package-level variable, or a field path on a receiver or struct value
+    (`s.root`, `s.cfg.Root`), whose every assignment **anywhere in this file**
+    (including its initializer and any assignment to a prefix of the path, such
+    as `s.cfg = ...`) has a trusted right-hand side.
+
+  An assignment whose right-hand side references a source-typed parameter, a
+  `library_mode`-tainted parameter, a call result from one, or the variable
+  being checked makes it untrusted, and so does anything the rules above cannot
+  classify. Untrusted means the rule does not apply (the finding stays).
+  Example: after `s.root = r.FormValue("root")` anywhere in the file,
+  `filepath.Join(s.root, filepath.Clean("/" + f))` is not sanitized.
+
+  Residual risk, stated: an assignment to the same package variable or field
+  from another file of the package is not visible to a per-file frontend. Phase B
+  (package scope) closes it by running the same check over every file of the
+  package. This definition is used by every "root" and "allowlist" below and by
+  the Join/Clean return-value sanitizer.
 
 Rules (the `Sanitize` is emitted at the first point where the rule holds):
 
@@ -463,8 +497,8 @@ Rules (the `Sanitize` is emitted at the first point where the rule holds):
 | `FILE_PATH` | `rel, err := filepath.Rel(root, p)` with `root` untainted and `p` normalized, **and** a rejection of `err != nil`, of `rel == ".."`, and of `strings.HasPrefix(rel, ".." + sep)` (or the stricter `HasPrefix(rel, "..")`) |
 | `FILE_PATH` | `filepath.IsLocal(p)` (rejects absolute paths, `..` escapes and reserved names by definition, so `p` stays under the working directory or under any root it is joined to) |
 | `FILE_PATH` | `!strings.Contains(p, "..")` **only** when the sink argument is `filepath.Join(root, p)` with `root` untainted (Join keeps an absolute `p` under `root`, and without `..` it cannot climb out). With the sink taking `p` directly, it sanitizes nothing (`/etc/passwd` has no `..`) |
-| `REDIRECT` | a relative-path check that closes network-path and backslash forms: `strings.HasPrefix(s, "/")` **and** rejection of `strings.HasPrefix(s, "//")` **and** of any backslash (`strings.Contains(s, "\\")`, or `HasPrefix(s, "/\\")`) |
-| `REDIRECT` | for `u, _ := url.Parse(s)`: rejection of `u.IsAbs()` **and** of `u.Host != ""` (catches `//evil.example`, which has no scheme so `IsAbs` is false) **and** of backslashes in `s` (catches `/\evil.example`, which Go parses with an empty host but browsers resolve to an external host) |
+| `REDIRECT` | a relative-path check that survives `http.Redirect`'s path cleaning and browser URL parsing: `strings.HasPrefix(s, "/")` **and** rejection of `strings.HasPrefix(s, "//")` **and** of a backslash **anywhere** in `s` (`strings.Contains(s, "\\")`; rejecting only a leading `/\` is not enough, since cleaning can bring a later backslash to the front) **and** of ASCII control characters anywhere in `s` (`/\t/evil.example` is sent unchanged and browsers strip the tab, giving `//evil.example`). The control-character part is also met by a rejected `url.Parse(s)` error, since `url.Parse` refuses control characters |
+| `REDIRECT` | for `u, err := url.Parse(s)`: rejection of `err != nil` (refuses control characters) **and** of `u.IsAbs()` **and** of `u.Host != ""` (catches `//evil.example`, which has no scheme so `IsAbs` is false) **and** of a backslash anywhere in `s` (catches `/\evil.example` and `/safe/../\evil.example`, which Go parses with an empty host but which clean to, or browsers resolve to, an external host) |
 | `REDIRECT`, `SSRF` | host allowlist: `u.Hostname()` (or `u.Host`) compared equal to an untainted constant, or checked for membership in an untainted map/slice, with the failing branch rejecting |
 | `ALLOC_SIZE` | any `if n > K { return }` bound (or `n < K` on the continuation), through the existing bounded-branch check; no guard fact needed |
 
@@ -482,6 +516,10 @@ bypasses must still fire:
 | `if u.IsAbs() { return }; http.Redirect(w, r, s, 302)` with `s = "//evil.example"` shape | CWE-601 |
 | `if !strings.HasPrefix(s, "/") \|\| strings.HasPrefix(s, "//") { return }; http.Redirect(...)` (no backslash check) | CWE-601 |
 | `http.Redirect(w, r, "/" + x, 302)` | CWE-601 |
+| `http.Redirect(w, r, "/safe/" + x, 302)` (constant path prefix, no `?`; `x = "../\\evil.example"` cleans to `/\evil.example`) | CWE-601 |
+| `if !strings.HasPrefix(s, "/") \|\| strings.HasPrefix(s, "//") \|\| strings.HasPrefix(s, "/\\") { return }; http.Redirect(...)` (leading-only backslash check) | CWE-601 |
+| relative-path guard with a full backslash check but no control-character or `url.Parse` error check (`/\t/evil.example`) | CWE-601 |
+| `s.root = r.FormValue("root")` elsewhere in the file, then `os.ReadFile(filepath.Join(s.root, filepath.Clean("/" + f)))` | CWE-22 |
 
 `template.JS(html.EscapeString(x))` is out of scope, so it produces nothing; a
 test asserts that, so adding a JS-context sink later is a deliberate change
@@ -561,7 +599,9 @@ Package-level summaries: scan all non-excluded `.go` files of a package together
 and extend `_go_summaries.py` from same-file to package scope (param → return,
 param → sink, param → out-param), using `_go_env`; imported in-repo packages
 after that. Enters with evidence from this milestone's VLoC measurement that
-cross-file flow is where recall is lost.
+cross-file flow is where recall is lost. Phase B also runs the trusted-root
+provenance check over every file of the package, closing the residual stated in
+Guard facts.
 
 Also deferred, each needing its own decision: closure capture;
 `http.ResponseWriter` XSS; context-specific sinks and sanitizers for
