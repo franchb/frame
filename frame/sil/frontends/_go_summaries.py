@@ -33,6 +33,7 @@ _RETURN = "$return"
 _PACKAGE_PROC = "go:$package"
 
 Flows = Dict[str, Dict[object, FrozenSet[str]]]
+GuardAt = Dict[int, Dict[str, FrozenSet[str]]]
 
 
 def exp_vars(exp) -> List[str]:
@@ -85,8 +86,13 @@ def _call_inputs(ins: Call, name: str, spec: Optional[ProcSpec]):
     return out
 
 
-def _flow(proc: Procedure, program: Program, seeds: Flows, include_fixpoint: bool) -> Flows:
+def _flow(proc: Procedure, program: Program, seeds: Flows, include_fixpoint: bool,
+          guard_at: Optional[GuardAt] = None) -> Flows:
+    """Flow-insensitive flows into each variable. `guard_at` adds, at a Call
+    or return Assign, the kinds the frontend's guard tracker had sanitized an
+    input variable for there (they hold on every path to that instruction)."""
     flows: Flows = {v: dict(ls) for v, ls in seeds.items()}
+    guard_at = guard_at or {}
     instrs = list(_instrs(proc))
 
     def add(var: str, label, kinds: FrozenSet[str]) -> bool:
@@ -109,16 +115,18 @@ def _flow(proc: Procedure, program: Program, seeds: Flows, include_fixpoint: boo
                     changed |= add(str(ins.var), _SRC, frozenset())
             elif isinstance(ins, Assign):
                 target = str(ins.id)
+                guarded = guard_at.get(id(ins), {})
                 for u in exp_vars(ins.exp):
                     for label, kinds in list(flows.get(u, {}).items()):
-                        changed |= add(target, label, kinds)
+                        changed |= add(target, label, kinds | guarded.get(u, frozenset()))
             elif isinstance(ins, Call) and ins.ret is not None:
                 ret = str(ins.ret[0])
                 name = ins.get_full_name()
                 spec = program.get_spec(name)
+                guarded = guard_at.get(id(ins), {})
                 for u, extra in _call_inputs(ins, name, spec):
                     for label, kinds in list(flows.get(u, {}).items()):
-                        changed |= add(ret, label, kinds | extra)
+                        changed |= add(ret, label, kinds | extra | guarded.get(u, frozenset()))
                 if spec is not None and spec.is_source:
                     changed |= add(ret, _SRC, frozenset())
             elif isinstance(ins, Return) and ins.value is not None:
@@ -178,7 +186,8 @@ def _has_own_source(proc: Procedure) -> bool:
                for i in _instrs(proc))
 
 
-def _summarize(proc: Procedure, program: Program, conservative: bool) -> None:
+def _summarize(proc: Procedure, program: Program, conservative: bool,
+               guard_at: Optional[GuardAt] = None) -> None:
     spec = proc.spec
     offset = 1 if proc.is_method else 0
     n_args = max(0, len(proc.params) - offset)
@@ -190,7 +199,7 @@ def _summarize(proc: Procedure, program: Program, conservative: bool) -> None:
         spec.is_source = "user" if _has_own_source(proc) else None
         return
     seeds: Flows = {p.name: {("p", i): frozenset()} for i, (p, _) in enumerate(proc.params)}
-    ret = _flow(proc, program, seeds, include_fixpoint=False).get(_RETURN, {})
+    ret = _flow(proc, program, seeds, include_fixpoint=False, guard_at=guard_at).get(_RETURN, {})
     params = sorted(label[1] for label in ret if isinstance(label, tuple))
     spec.taint_propagates = [i - offset for i in params if i >= offset]
     spec.taint_from_receiver = proc.is_method and 0 in params
@@ -230,17 +239,24 @@ def _insert_mark(proc: Procedure, idx: int, kinds: FrozenSet[str]) -> None:
     entry.instrs[0:0] = new
 
 
-def _site_kinds(flows: Flows, var_names: List[str]) -> Optional[FrozenSet[str]]:
-    """Kinds sanitized on every source flow into these variables; None if untainted."""
+def _site_kinds(flows: Flows, var_names: List[str],
+                guarded: Optional[Dict[str, FrozenSet[str]]] = None) -> Optional[FrozenSet[str]]:
+    """Kinds sanitized on every source flow into these variables (plus the
+    guard kinds holding for each variable at the site); None if untainted."""
     kinds: Optional[FrozenSet[str]] = None
+    guarded = guarded or {}
     for v in var_names:
         k = flows.get(v, {}).get(_SRC)
         if k is not None:
+            k = k | guarded.get(v, frozenset())
             kinds = k if kinds is None else kinds & k
     return kinds
 
 
-def apply_same_file_flow(program: Program, site_callees: Dict[str, str]) -> None:
+def apply_same_file_flow(program: Program, site_callees: Dict[str, str],
+                         guard_at: Optional[GuardAt] = None,
+                         variadic: Optional[Set[str]] = None) -> None:
+    guard_at = guard_at or {}
     procs = {n: p for n, p in program.procedures.items() if n != _PACKAGE_PROC}
     # 1. Every site that resolves to a same-file procedure shares its spec object.
     for site, callee in site_callees.items():
@@ -257,7 +273,7 @@ def apply_same_file_flow(program: Program, site_callees: Dict[str, str]) -> None
     for comp in _sccs(graph):
         recursive = len(comp) > 1 or any(n in graph[n] for n in comp)
         for n in comp:
-            _summarize(procs[n], program, conservative=recursive)
+            _summarize(procs[n], program, conservative=recursive, guard_at=guard_at)
     # 3. Into callees, to a fixpoint. marks[(callee, param index)] holds the
     # sink kinds sanitized on EVERY tainted flow into that parameter, over all
     # call sites. Marks are only added or narrowed, so the loop terminates.
@@ -268,7 +284,7 @@ def apply_same_file_flow(program: Program, site_callees: Dict[str, str]) -> None
         for pname, proc in procs.items():
             seeds: Flows = {proc.params[i][0].name: {_SRC: k}
                             for (c, i), k in marks.items() if c == pname}
-            flows = _flow(proc, program, seeds, include_fixpoint=False)
+            flows = _flow(proc, program, seeds, include_fixpoint=False, guard_at=guard_at)
             for ins in _instrs(proc):
                 if not isinstance(ins, Call):
                     continue
@@ -277,11 +293,12 @@ def apply_same_file_flow(program: Program, site_callees: Dict[str, str]) -> None
                 if callee is None:
                     continue
                 offset = 1 if callee.is_method else 0
-                hits = {j + offset: _site_kinds(flows, exp_vars(a))
+                guarded = guard_at.get(id(ins), {})
+                hits = {j + offset: _site_kinds(flows, exp_vars(a), guarded)
                         for j, (a, _) in enumerate(ins.args)}
                 if callee.is_method:
                     recv = _receiver_of(ins.get_full_name())
-                    hits[0] = _site_kinds(flows, [recv] if recv else [])
+                    hits[0] = _site_kinds(flows, [recv] if recv else [], guarded)
                 for idx, kinds in hits.items():
                     if kinds is None or idx >= len(callee.params):
                         continue

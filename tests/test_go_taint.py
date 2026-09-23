@@ -1036,3 +1036,37 @@ def test_ssrf_comma_ok_binding_is_killed_by_reassignment():
     reparsed = body % 'u, err = url.Parse(r.FormValue("v"))\n_ = err'
     assert "CWE-918" in _cwes(_handler(reparsed.replace("http.Get(s)", "http.Get(u.String())"),
                                        RD, SET_ALLOWED))
+
+
+# ---- guard sanitization across same-file call boundaries ------------------------------
+READ_IT = "func readIt(p string) { os.ReadFile(p) }"
+
+
+def test_guard_before_same_file_call_sanitizes_the_callee_parameter():
+    _pair("CWE-22",
+          _handler('p := r.FormValue("p")\nreadIt(p)', FS, READ_IT),
+          _handler('p := r.FormValue("p")\nif !filepath.IsLocal(p) { return }\nreadIt(p)', FS, READ_IT))
+
+
+def test_guard_into_callee_is_intersected_over_call_sites():
+    body = ('p := r.FormValue("p")\nq := r.FormValue("q")\n'
+            'if !filepath.IsLocal(p) { return }\nreadIt(p)\nreadIt(q)')
+    assert "CWE-22" in _cwes(_handler(body, FS, READ_IT))
+
+
+def test_guard_into_method_callee_receiver_argument():
+    extra = "type S struct{}\nvar s *S\nfunc (x *S) readIt(p string) { os.ReadFile(p) }"
+    _pair("CWE-22",
+          _handler('p := r.FormValue("p")\ns.readIt(p)', FS, extra),
+          _handler('p := r.FormValue("p")\nif !filepath.IsLocal(p) { return }\ns.readIt(p)', FS, extra))
+
+
+def test_guarding_helper_is_a_sanitizer_summary():
+    silent = 'func clean(p string) string { if !filepath.IsLocal(p) { return "" }; return p }'
+    firing = 'func clean(p string) string { if !filepath.IsLocal(p) { _ = p }; return p }'
+    body = 'os.ReadFile(clean(r.FormValue("p")))'
+    _pair("CWE-22", _handler(body, FS, firing), _handler(body, FS, silent))
+    # The guard proves nothing about shell injection.
+    assert "CWE-78" in _cwes(_handler('exec.Command(clean(r.FormValue("p")))',
+                                      FS + '\n"os/exec"', silent))
+

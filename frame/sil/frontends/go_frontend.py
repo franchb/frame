@@ -40,7 +40,7 @@ from frame.sil.frontends._go_env import (
     GoType, UNKNOWN, BUILTIN_TYPES, FileEnv, Scope, build_file_env,
     literal_value, params_of, statements_of, text as node_text, type_of,
 )
-from frame.sil.frontends._go_summaries import apply_same_file_flow
+from frame.sil.frontends._go_summaries import apply_same_file_flow, exp_vars
 from frame.sil.specs.go_specs import (
     GO_SPECS, CONST_ARG0_EXEMPT, EMPTY_BUILTINS, FIELD_TYPES,
     HANDLER_REGISTRAR_FUNCS, HANDLER_REGISTRAR_METHODS, LIBRARY_PARAM_TYPES,
@@ -93,6 +93,10 @@ class GoFrontend:
         self._literal_names: Dict[int, str] = {}
         self._literal_counts: Dict[str, int] = {}
         self._site_callees: Dict[str, str] = {}
+        # id(instr) -> {SIL var: sink kinds the guard tracker has Sanitize'd it
+        # for on every path reaching that Call / return Assign}.
+        self._guard_at: Dict[int, Dict[str, frozenset]] = {}
+        self._variadic_procs: Set[str] = set()
         self._handler_nodes: Set[int] = set()
         self._handler_funcs: Set[str] = set()
         self._handler_methods: Set[Tuple[str, str]] = set()   # (receiver type, method)
@@ -126,7 +130,17 @@ class GoFrontend:
                                     text=self._t, var_of=lambda n: self._sil(self._t(n)))
 
     def _after_lowering(self) -> None:
-        apply_same_file_flow(self._program, self._site_callees)
+        apply_same_file_flow(self._program, self._site_callees, self._guard_at,
+                             self._variadic_procs)
+
+    def _record_guard_kinds(self, instr, var_names: List[str]) -> None:
+        """The guard kinds holding for these variables here: the tracker's
+        emitted set is restored at branches and intersected at joins, so it
+        holds on every path, and the same-file summaries can use it."""
+        emitted = self._guards.emitted if hasattr(self, "_guards") else {}
+        kinds = {v: frozenset(emitted[v]) for v in var_names if emitted.get(v)}
+        if kinds:
+            self._guard_at[id(instr)] = kinds
 
     def _on_branch(self, cond_node, truth: bool, node: Node) -> None:
         for var, kinds in sorted(self._guards.on_branch(cond_node, truth).items()):
@@ -714,7 +728,9 @@ class GoFrontend:
             value = v if value is None else ExpBinOp("+", value, v)
         if value is not None:
             ret_var = self._new_ident("ret")
-            self._add(Assign(loc=loc, id=ret_var, exp=value))
+            ret_assign = Assign(loc=loc, id=ret_var, exp=value)
+            self._add(ret_assign)
+            self._record_guard_kinds(ret_assign, exp_vars(value))
             value = ExpVar(ret_var)
         self._emit_defers()                 # operands first, then deferred calls
         self._add(Return(loc=loc, value=value))
@@ -1103,8 +1119,13 @@ class GoFrontend:
     def _emit_call(self, loc, name: str, arg_exps: List[Exp], spec: Optional[ProcSpec] = None,
                    callee_proc: Optional[str] = None, key: Optional[str] = None) -> Exp:
         ret = self._new_ident("c")
-        self._add(Call(loc=loc, ret=(ret, Typ.unknown_type()), func=ExpConst.string(name),
-                       args=[(a, Typ.unknown_type()) for a in arg_exps]))
+        call = Call(loc=loc, ret=(ret, Typ.unknown_type()), func=ExpConst.string(name),
+                    args=[(a, Typ.unknown_type()) for a in arg_exps])
+        self._add(call)
+        names = [v for a in arg_exps for v in exp_vars(a)]
+        if "." in name and not name.startswith("go:"):
+            names.append(name.rsplit(".", 1)[0])
+        self._record_guard_kinds(call, names)
         if spec is not None:
             self._register(name, spec)
         if callee_proc is not None:
