@@ -19,10 +19,12 @@ must-analysis (intersection) for sanitization.
 
 from typing import Dict, FrozenSet, List, Optional, Set
 
-from frame.sil.instructions import Assign, Call, Return, TaintKind, TaintSource
+from frame.sil.instructions import (
+    Assign, Call, Return, Sanitize, SinkKind, TaintKind, TaintSource,
+)
 from frame.sil.procedure import Procedure, Program, ProcSpec
 from frame.sil.types import (
-    ExpBinOp, ExpConst, ExpFieldAccess, ExpIndex, ExpStringConcat, ExpUnOp, ExpVar,
+    ExpBinOp, ExpFieldAccess, ExpIndex, ExpStringConcat, ExpUnOp, ExpVar,
 )
 
 FIXPOINT_DESC = "Go same-file flow: tainted argument from a caller"
@@ -196,21 +198,49 @@ def _summarize(proc: Procedure, program: Program, conservative: bool) -> None:
     kinds = None
     for k in ret.values():
         kinds = set(k) if kinds is None else kinds & k
-    spec.is_sanitizer = sorted(kinds) if kinds else []
+    # SILTranslator treats a sanitizer spec as "argument 0 flows to the result",
+    # so a sanitizer summary on a helper whose argument 0 does not reach a return
+    # would invent that flow. Only claim sanitization when argument 0 propagates.
+    spec.is_sanitizer = sorted(kinds) if kinds and 0 in spec.taint_propagates else []
 
 
-def _mark_param(proc: Procedure, idx: int) -> bool:
+def _sink_kinds(kinds: FrozenSet[str]) -> List[SinkKind]:
+    out = []
+    for k in sorted(kinds):
+        try:
+            out.append(SinkKind(k))
+        except ValueError:
+            continue
+    return out
+
+
+def _insert_mark(proc: Procedure, idx: int, kinds: FrozenSet[str]) -> None:
+    """TaintSource for parameter idx at entry, then a Sanitize for the kinds
+    every tainted call site had already sanitized the argument for."""
     pvar = proc.params[idx][0]
     entry = proc.nodes[proc.entry_node]
     if any(isinstance(i, TaintSource) and i.var == pvar for i in entry.instrs):
-        return False
-    entry.instrs.insert(0, TaintSource(loc=proc.loc, var=pvar, kind=TaintKind.USER_INPUT,
-                                       description=FIXPOINT_DESC))
-    return True
+        return
+    new = [TaintSource(loc=proc.loc, var=pvar, kind=TaintKind.USER_INPUT,
+                       description=FIXPOINT_DESC)]
+    sanitizes = _sink_kinds(kinds)
+    if sanitizes:
+        new.append(Sanitize(loc=proc.loc, var=pvar, sanitizes=sanitizes,
+                            description=FIXPOINT_DESC))
+    entry.instrs[0:0] = new
 
 
-def apply_same_file_flow(program: Program, site_callees: Dict[str, str],
-                         max_rounds: int = 10) -> None:
+def _site_kinds(flows: Flows, var_names: List[str]) -> Optional[FrozenSet[str]]:
+    """Kinds sanitized on every source flow into these variables; None if untainted."""
+    kinds: Optional[FrozenSet[str]] = None
+    for v in var_names:
+        k = flows.get(v, {}).get(_SRC)
+        if k is not None:
+            kinds = k if kinds is None else kinds & k
+    return kinds
+
+
+def apply_same_file_flow(program: Program, site_callees: Dict[str, str]) -> None:
     procs = {n: p for n, p in program.procedures.items() if n != _PACKAGE_PROC}
     # 1. Every site that resolves to a same-file procedure shares its spec object.
     for site, callee in site_callees.items():
@@ -228,25 +258,38 @@ def apply_same_file_flow(program: Program, site_callees: Dict[str, str],
         recursive = len(comp) > 1 or any(n in graph[n] for n in comp)
         for n in comp:
             _summarize(procs[n], program, conservative=recursive)
-    # 3. Into callees, to a fixpoint.
-    for _ in range(max_rounds):
+    # 3. Into callees, to a fixpoint. marks[(callee, param index)] holds the
+    # sink kinds sanitized on EVERY tainted flow into that parameter, over all
+    # call sites. Marks are only added or narrowed, so the loop terminates.
+    marks: Dict[tuple, FrozenSet[str]] = {}
+    changed = True
+    while changed:
         changed = False
-        for proc in procs.values():
-            flows = _flow(proc, program, {}, include_fixpoint=True)
-            tainted = {v for v, labels in flows.items() if _SRC in labels}
+        for pname, proc in procs.items():
+            seeds: Flows = {proc.params[i][0].name: {_SRC: k}
+                            for (c, i), k in marks.items() if c == pname}
+            flows = _flow(proc, program, seeds, include_fixpoint=False)
             for ins in _instrs(proc):
                 if not isinstance(ins, Call):
                     continue
-                callee = procs.get(site_callees.get(ins.get_full_name(), ""))
+                cname = site_callees.get(ins.get_full_name(), "")
+                callee = procs.get(cname)
                 if callee is None:
                     continue
                 offset = 1 if callee.is_method else 0
-                hits = {j + offset for j, (a, _) in enumerate(ins.args)
-                        if set(exp_vars(a)) & tainted}
-                if callee.is_method and _receiver_of(ins.get_full_name()) in tainted:
-                    hits.add(0)
-                for idx in sorted(hits):
-                    if idx < len(callee.params) and _mark_param(callee, idx):
+                hits = {j + offset: _site_kinds(flows, exp_vars(a))
+                        for j, (a, _) in enumerate(ins.args)}
+                if callee.is_method:
+                    recv = _receiver_of(ins.get_full_name())
+                    hits[0] = _site_kinds(flows, [recv] if recv else [])
+                for idx, kinds in hits.items():
+                    if kinds is None or idx >= len(callee.params):
+                        continue
+                    key = (cname, idx)
+                    old = marks.get(key)
+                    new = kinds if old is None else old & kinds
+                    if new != old:
+                        marks[key] = new
                         changed = True
-        if not changed:
-            break
+    for (cname, idx), kinds in sorted(marks.items()):
+        _insert_mark(procs[cname], idx, kinds)

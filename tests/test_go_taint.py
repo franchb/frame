@@ -226,3 +226,38 @@ def test_multi_result_helper_keeps_taint():
     src = _handler('v, _ := id2(r.FormValue("cmd"))\nexec.Command(v)', '"net/http"\n"os/exec"',
                    "func id2(s string) (string, error) { return s, nil }")
     assert "CWE-78" in _cwes(src)
+
+
+def test_sanitizer_summary_requires_first_argument_to_propagate():
+    imports = '"net/http"\n"os/exec"\n"path/filepath"'
+    silent = "func pb(c string, p string) string { return filepath.Base(p) }"
+    firing = "func pb(c string, p string) string { return filepath.Base(c) }"
+    body = 'exec.Command(pb(r.FormValue("c"), "x"))'
+    _pair("CWE-78", _handler(body, imports, firing), _handler(body, imports, silent))
+
+
+def test_sanitized_argument_stays_sanitized_in_callee():
+    imports = '"net/http"\n"os"\n"path/filepath"'
+    extra = "func open1(p string) { os.Open(p) }"
+    _pair("CWE-22", _handler('open1(r.FormValue("f"))', imports, extra),
+          _handler('open1(filepath.Base(r.FormValue("f")))', imports, extra))
+
+
+def test_callee_sanitization_is_intersected_over_call_sites():
+    imports = '"net/http"\n"os"\n"path/filepath"'
+    extra = "func open1(p string) { os.Open(p) }"
+    body = 'open1(filepath.Base(r.FormValue("f")))\nopen1(r.FormValue("g"))'
+    assert "CWE-22" in _cwes(_handler(body, imports, extra))
+
+
+def _chain(n: int, reverse: bool) -> str:
+    funcs = [f"func h{i}(s string) {{ h{i + 1}(s) }}" for i in range(1, n)]
+    funcs.append(f"func h{n}(s string) {{ exec.Command(s).Run() }}")
+    if reverse:
+        funcs.reverse()
+    return _handler('h1(r.FormValue("cmd"))', '"net/http"\n"os/exec"', "\n".join(funcs))
+
+
+def test_long_helper_chain_reaches_sink_in_any_definition_order():
+    assert "CWE-78" in _cwes(_chain(13, reverse=False))
+    assert "CWE-78" in _cwes(_chain(13, reverse=True))
