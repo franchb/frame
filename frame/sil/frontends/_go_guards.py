@@ -47,6 +47,13 @@ def _enclosing_fn(node):
     return node
 
 
+def _assigns_existing(node) -> bool:
+    """A range_clause / receive_statement whose targets are assigned with `=`
+    (not declared with `:=`)."""
+    return node.child_by_field_name("left") is not None and any(
+        not c.is_named and c.type == "=" for c in node.children)
+
+
 def _elem_expr(node):
     """The expression inside a literal_element (or the node itself)."""
     if node is not None and node.type == "literal_element" and node.named_children:
@@ -193,6 +200,13 @@ class TrustOracle:
                 fn = _enclosing_fn(n)
                 for i, l in enumerate(ls):
                     self._record_target(l, rs[i] if len(rs) == len(ls) else None, fn)
+            elif n.type in ("range_clause", "receive_statement") and _assigns_existing(n):
+                # `for k, t = range xs` / `case t = <-ch:` store into existing
+                # targets; the stored value is not tracked, so it is unknown.
+                lefts = n.child_by_field_name("left")
+                fn = _enclosing_fn(n)
+                for l in (lefts.named_children if lefts is not None else []):
+                    self._record_target(l, None, fn)
             elif n.type == "unary_expression":
                 op = n.child_by_field_name("operator")
                 if op is not None and self.text(op) == "&":
@@ -251,10 +265,15 @@ class TrustOracle:
                 vals = values.named_children if values is not None else []
                 for i, name in enumerate(n.children_by_field_name("name")):
                     defs.setdefault(self.text(name), []).append(vals[i] if i < len(vals) else "zero")
-            elif n.type == "range_clause":
+            elif n.type in ("range_clause", "receive_statement"):
                 left = n.child_by_field_name("left")
                 for l in (left.named_children if left is not None else []):
-                    defs.setdefault(self.text(l), []).append(None)
+                    base = _strip(l)
+                    while base is not None and base.type in ("selector_expression",
+                                                             "index_expression", "unary_expression"):
+                        base = _strip(base.child_by_field_name("operand"))
+                    if base is not None and base.type == "identifier":
+                        defs.setdefault(self.text(base), []).append(None)
         return defs
 
     def _frame_for(self, fn_node) -> _Frame:
@@ -481,6 +500,10 @@ class TrustOracle:
                 up, above = above, above.parent
             if above is not None and above.type == "expression_list" and above.parent is not None \
                     and above.parent.type == "assignment_statement" \
+                    and above == above.parent.child_by_field_name("left"):
+                return False
+            if above is not None and above.type == "expression_list" and above.parent is not None \
+                    and above.parent.type in ("range_clause", "receive_statement") \
                     and above == above.parent.child_by_field_name("left"):
                 return False
             if above is not None and above.type in ("inc_statement", "dec_statement"):

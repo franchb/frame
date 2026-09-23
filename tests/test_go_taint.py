@@ -705,3 +705,41 @@ def test_redirect_twin_range_and_len_reads_keep_allowlist():
     extra = ALLOWED + '\nfunc o() int { n := len(allowed); for k := range allowed { _ = k }; return n }'
     tainted = ALLOWED + '\nfunc o() { a := allowed; _ = a }'
     _pair("CWE-601", _handler(MAP_GUARD, RD, tainted), _handler(MAP_GUARD, RD, extra))
+
+
+def test_ssrf_bypass_range_assigns_into_allowlist_element():
+    # `for i, HOSTS[0] = range xs` stores each element into HOSTS: a write.
+    extra = HOSTS + _ADD % 'var i int; for i, HOSTS[0] = range []string{r.FormValue("h")} { _ = i }'
+    assert "CWE-918" in _cwes(_handler(HOSTS_GUARD, RD + '\n"slices"', extra))
+
+
+def test_ssrf_bypass_select_receive_into_allowlist_element():
+    # `case HOSTS[0] = <-ch:` stores the received value into HOSTS: a write.
+    extra = HOSTS + _ADD % ('ch := make(chan string, 1); ch <- r.FormValue("h")\n'
+                            'select { case HOSTS[0] = <-ch: }')
+    assert "CWE-918" in _cwes(_handler(HOSTS_GUARD, RD + '\n"slices"', extra))
+
+
+def test_ssrf_twin_range_and_receive_into_locals_keep_allowlist():
+    # Reading HOSTS and assigning range / receive results to locals is fine.
+    extra = HOSTS + _ADD % ('var s string; for _, s = range HOSTS { _ = s }\n'
+                            'ch := make(chan string, 1); select { case s = <-ch: _ = s }')
+    tainted = HOSTS + _ADD % 'var i int; for i, HOSTS[0] = range []string{r.FormValue("h")} { _ = i }'
+    _pair("CWE-918", _handler(HOSTS_GUARD, RD + '\n"slices"', tainted),
+          _handler(HOSTS_GUARD, RD + '\n"slices"', extra))
+
+
+_ROOT_SERVE = ('type S struct{ root string }\n'
+               'func (s *S) Serve(w http.ResponseWriter, r *http.Request) {\n  %s\n'
+               '  os.ReadFile(filepath.Join(s.root, filepath.Clean("/" + r.FormValue("f"))))\n}')
+
+
+def test_fs_bypass_range_assigns_receiver_root():
+    extra = _ROOT_SERVE % 'for _, s.root = range []string{r.FormValue("r")} {}'
+    assert "CWE-22" in _cwes(_handler("", FS, extra))
+
+
+def test_fs_bypass_select_receive_assigns_receiver_root():
+    extra = _ROOT_SERVE % ('ch := make(chan string, 1); ch <- r.FormValue("r")\n'
+                           '  select { case s.root = <-ch: }')
+    assert "CWE-22" in _cwes(_handler("", FS, extra))
