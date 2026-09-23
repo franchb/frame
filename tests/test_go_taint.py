@@ -743,3 +743,120 @@ def test_fs_bypass_select_receive_assigns_receiver_root():
     extra = _ROOT_SERVE % ('ch := make(chan string, 1); ch <- r.FormValue("r")\n'
                            '  select { case s.root = <-ch: }')
     assert "CWE-22" in _cwes(_handler("", FS, extra))
+
+
+# ---- remaining sink rows ---------------------------------------------------------
+def test_sqlx_select_fires_and_param_twin_is_silent():
+    imports = '"net/http"\n"github.com/jmoiron/sqlx"'
+    extra = "var db *sqlx.DB"
+    assert "CWE-89" in _cwes(_handler(
+        'var out []string\ndb.Select(&out, "SELECT * FROM t WHERE n = \'"+r.FormValue("n")+"\'")',
+        imports, extra))
+    assert "CWE-89" not in _cwes(_handler(
+        'var out []string\ndb.Select(&out, "SELECT * FROM t WHERE n = ?", r.FormValue("n"))',
+        imports, extra))
+
+
+def test_gorm_raw_and_where():
+    imports = '"net/http"\n"gorm.io/gorm"'
+    extra = "var db *gorm.DB"
+    assert "CWE-89" in _cwes(_handler('db.Raw("SELECT * FROM t WHERE n = " + r.FormValue("n"))', imports, extra))
+    assert "CWE-89" in _cwes(_handler('db.Where("name = \'" + r.FormValue("n") + "\'").Find(nil)', imports, extra))
+    assert "CWE-89" not in _cwes(_handler('db.Where("name = ?", r.FormValue("n")).Find(nil)', imports, extra))
+
+
+def test_command_context_and_shell_retarget():
+    imports = '"context"\n"net/http"\n"os/exec"'
+    assert "CWE-78" in _cwes(_handler(
+        'exec.CommandContext(context.Background(), r.FormValue("c"))', imports))
+    assert "CWE-78" in _cwes(_handler('exec.Command("sh", "-c", r.FormValue("c"))', imports))
+    assert "CWE-78" not in _cwes(_handler('exec.Command("sh", "-c", "ls -l", r.FormValue("c"))', imports))
+    assert "CWE-78" not in _cwes(_handler('exec.Command("git", "log", r.FormValue("c"))', imports))
+
+
+def test_servefile_and_http_dir():
+    imports = '"net/http"'
+    assert "CWE-22" in _cwes(_handler('http.ServeFile(w, r, r.URL.Query().Get("f"))', imports))
+    assert "CWE-22" in _cwes(_handler('_ = http.FileServer(http.Dir(r.FormValue("d")))', imports))
+
+
+def test_framework_redirects():
+    assert "CWE-601" in _cwes('''package main
+import "github.com/gin-gonic/gin"
+func h(c *gin.Context) { c.Redirect(302, c.Query("next")) }''')
+    assert "CWE-601" in _cwes('''package main
+import "github.com/labstack/echo/v4"
+func h(c echo.Context) error { return c.Redirect(302, c.QueryParam("next")) }''')
+
+
+def test_ssrf_request_constructors():
+    imports = '"context"\n"net/http"'
+    assert "CWE-918" in _cwes(_handler('http.NewRequest("GET", r.FormValue("u"), nil)', imports))
+    assert "CWE-918" in _cwes(_handler(
+        'http.NewRequestWithContext(context.Background(), "GET", r.FormValue("u"), nil)', imports))
+    assert "CWE-918" in _cwes(_handler('c := &http.Client{}\nc.Get(r.FormValue("u"))', imports))
+
+
+def test_strings_repeat_alloc():
+    assert "CWE-770" in _cwes(_handler(
+        'n, _ := strconv.Atoi(r.FormValue("n"))\n_ = strings.Repeat("a", n)',
+        '"net/http"\n"strconv"\n"strings"'))
+
+
+def test_fiber_source_and_unmarshal_out_param():
+    assert "CWE-78" in _cwes('''package main
+import ("github.com/gofiber/fiber/v2"; "os/exec")
+func h(c *fiber.Ctx) error { exec.Command(c.Query("x")); return nil }''')
+    assert "CWE-78" in _cwes(_handler(
+        'body, _ := io.ReadAll(r.Body)\nvar in struct{ C string }\njson.Unmarshal(body, &in)\nexec.Command(in.C)',
+        '"encoding/json"\n"io"\n"net/http"\n"os/exec"'))
+
+
+def test_builder_receiver_mutation():
+    assert "CWE-89" in _cwes(_handler(
+        'var b strings.Builder\nb.WriteString("SELECT * FROM t WHERE n = ")\n'
+        'b.WriteString(r.FormValue("n"))\ndb.Query(b.String())',
+        '"database/sql"\n"net/http"\n"strings"', "var db *sql.DB"))
+
+
+def test_library_mode_exported_params():
+    src = '''package lib
+import "os/exec"
+func Run(cmd string) { exec.Command(cmd).Run() }
+func run(cmd string) { exec.Command(cmd).Run() }'''
+    assert "CWE-78" not in _cwes(src)
+    result = FrameScanner(language="go", verify=False, library_mode=True).scan(src, "t.go")
+    procs = {v.procedure for v in result.vulnerabilities if v.cwe_id == "CWE-78"}
+    assert procs == {"go:Run"}
+
+
+# ---- structural detectors on Go ------------------------------------------------------
+def test_daemon_loop_is_not_cwe_835():
+    src = '''package main
+import "net"
+func serve(l net.Listener) {
+	for {
+		c, err := l.Accept()
+		if err != nil { continue }
+		go handle(c)
+	}
+}
+func handle(c net.Conn) {}'''
+    assert "CWE-835" not in _cwes(src)
+
+
+def test_recursion_with_base_case_is_silent():
+    src = '''package main
+func fact(n int) int { if n <= 1 { return 1 }; return n * fact(n-1) }'''
+    assert "CWE-674" not in _cwes(src)
+
+
+def test_recursion_without_base_case_fires():
+    src = '''package main
+func loop(n int) int { return loop(n + 1) }'''
+    assert "CWE-674" in _cwes(src)
+
+
+def test_hardcoded_secret_scan_runs_on_go():
+    assert "CWE-798" in _cwes('package main\nconst apiKey = "sk_live_51HxQ8rT9vYdZ3kP"\n')
+    assert "CWE-798" not in _cwes('package main\nconst greeting = "hello there, friend"\n')
