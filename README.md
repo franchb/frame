@@ -108,7 +108,8 @@ frame scan ./repo --ai -f json | \
 
 ## Supported Languages
 
-The symbolic engine has sound frontends for five languages:
+The symbolic engine has sound frontends for five languages, plus a Go frontend
+scoped to taint + CWE-770:
 
 | Language | Frameworks & Libraries |
 |----------|----------------------|
@@ -117,8 +118,9 @@ The symbolic engine has sound frontends for five languages:
 | **JavaScript/TypeScript** | Express, Node.js, DOM APIs |
 | **C/C++** | POSIX, Windows API, memory operations |
 | **C#** | ASP.NET, Entity Framework, ADO.NET |
+| **Go** (taint + CWE-770) | net/http, database/sql, os/exec, gin, echo, gorm |
 
-The LLM layer (`--ai`) runs on any language, including ones with no symbolic frontend (PHP, Ruby, Go, and more). Those findings stay in the LLM tier, never mixed with the sound symbolic results.
+The LLM layer (`--ai`) runs on any language, including ones with no symbolic frontend (PHP, Ruby, and more) and on the Go CWE classes outside the symbolic frontend's scope. Those findings stay in the LLM tier, never mixed with the sound symbolic results.
 
 ## What Frame Detects
 
