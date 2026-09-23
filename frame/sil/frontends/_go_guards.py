@@ -598,15 +598,25 @@ class TrustOracle:
 
 
 # --------------------------------------------------------------------------- guards
+def _src_name(var: str) -> str:
+    """The source identifier of a SIL variable (`p#3` -> `p`); the trust
+    oracle is name-based."""
+    return var.split("#", 1)[0]
+
+
 class _GuardCounter:
     n = 0          # unique Rel-call instance ids (never reset: ids only need to differ)
 
 
 class GuardTracker:
     def __init__(self, src: bytes, trust: TrustOracle, key_of: Callable,
-                 arg_nodes: Callable, const_str: Callable, text: Callable):
+                 arg_nodes: Callable, const_str: Callable, text: Callable,
+                 var_of: Optional[Callable] = None):
         self.src, self.trust = src, trust
         self.key_of, self.arg_nodes, self.const_str, self.text = key_of, arg_nodes, const_str, text
+        # Facts are keyed by the SIL variable an identifier resolves to, so a
+        # shadowing declaration's facts never reach the outer binding.
+        self.var_of = var_of or text
         self.clear()
 
     # ---- state
@@ -686,14 +696,14 @@ class GuardTracker:
         if key in NORMALIZING_KEYS and first != "_":
             self.normalized = self.normalized | {first}
         if key in _URL_PARSE and args and _strip(args[0]).type == "identifier":
-            s = self.text(_strip(args[0]))
+            s = self.var_of(_strip(args[0]))
             if first != "_":
                 self.url_src[first] = s
             if err != "_":
                 self.url_err[err] = s
         if key == "path/filepath.Rel" and len(args) == 2 and _strip(args[1]).type == "identifier":
-            p = self.text(_strip(args[1]))
-            root = self.text(args[0]) if self.trust.trusted(args[0], checked=p) else None
+            p = self.var_of(_strip(args[1]))
+            root = self.text(args[0]) if self.trust.trusted(args[0], checked=_src_name(p)) else None
             _GuardCounter.n += 1
             inst = f"rel#{_GuardCounter.n}"
             if first != "_":
@@ -739,7 +749,7 @@ class GuardTracker:
 
     def _var(self, node) -> Optional[str]:
         node = _strip(node)
-        return self.text(node) if node is not None and node.type == "identifier" else None
+        return self.var_of(node) if node is not None and node.type == "identifier" else None
 
     def _url_vars(self, u: str) -> List[str]:
         return [u] + ([self.url_src[u]] if u in self.url_src else [])
@@ -835,7 +845,7 @@ class GuardTracker:
         if node is not None and node.type == "binary_expression" and self._op(node) == "+":
             root = node.child_by_field_name("left")
             sep = node.child_by_field_name("right")
-            if self.text(sep) in _SEPARATOR_TEXTS and self.trust.trusted(root, checked=v):
+            if self.text(sep) in _SEPARATOR_TEXTS and self.trust.trusted(root, checked=_src_name(v)):
                 return self._clauses([v], "prefix_sep", self.text(root), truth)
         return [_UNKNOWN]
 
@@ -861,7 +871,7 @@ class GuardTracker:
             if av in self.rel_src and self.const_str(b) == "..":
                 _, p, inst = self.rel_src[av]
                 return self._clauses([p], "rel_eq_dotdot", inst, equal)
-            if av and b is not None and self.trust.trusted(b, checked=av):
+            if av and b is not None and self.trust.trusted(b, checked=_src_name(av)):
                 return self._clauses([av], "eq_root", self.text(b), equal)
         return [_UNKNOWN]
 

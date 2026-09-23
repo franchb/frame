@@ -270,15 +270,24 @@ def build_file_env(root, src: bytes) -> FileEnv:
 
 class Scope:
     """Lexical scope for locals. A name declared in any enclosing function
-    scope shadows package-level names and import aliases."""
+    scope shadows package-level names and import aliases.
 
-    def __init__(self, parent: Optional["Scope"] = None):
+    `sil` maps a name declared here to the SIL variable that holds it: a
+    declaration shadowing a local of the same procedure gets a fresh SIL name,
+    so the two bindings never share taint or guard facts. `proc_root` marks a
+    procedure's outermost scope (its parameters and named results)."""
+
+    def __init__(self, parent: Optional["Scope"] = None, proc_root: bool = False):
         self.parent = parent
+        self.proc_root = proc_root
         self.names: Dict[str, GoType] = {}
+        self.sil: Dict[str, str] = {}
 
-    def declare(self, name: str, typ: GoType = UNKNOWN) -> None:
+    def declare(self, name: str, typ: GoType = UNKNOWN, sil: Optional[str] = None) -> None:
         if name and name != "_":
             self.names[name] = typ
+            if sil is not None:
+                self.sil[name] = sil
 
     def lookup(self, name: str) -> Optional[GoType]:
         scope = self
@@ -287,6 +296,29 @@ class Scope:
                 return scope.names[name]
             scope = scope.parent
         return None
+
+    def sil_name(self, name: str) -> str:
+        """The SIL variable of the binding `name` resolves to here."""
+        scope = self
+        while scope is not None:
+            if name in scope.names:
+                return scope.sil.get(name, name)
+            scope = scope.parent
+        return name
+
+    def shadows_local(self, name: str) -> bool:
+        """Would declaring `name` here shadow a binding of an enclosing scope
+        of the same procedure?"""
+        if self.proc_root:
+            return False
+        scope = self.parent
+        while scope is not None:
+            if name in scope.names:
+                return True
+            if scope.proc_root:
+                return False
+            scope = scope.parent
+        return False
 
     def child(self) -> "Scope":
         return Scope(self)

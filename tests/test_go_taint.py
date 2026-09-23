@@ -915,3 +915,83 @@ def test_out_param_does_not_keep_the_destinations_old_sanitization():
           _handler('p := filepath.Base(r.FormValue("p"))\n'
                    'json.NewDecoder(r.Body).Decode(&p)\nos.ReadFile(p)', imports),
           _handler('p := filepath.Base(r.FormValue("p"))\nos.ReadFile(p)', imports))
+
+
+# ---- shadowing declarations are distinct variables --------------------------------------
+EX = '"net/http"\n"os/exec"'
+
+
+def test_comma_ok_shadow_does_not_clean_the_outer_variable():
+    extra = 'var db *sql.DB\nvar aliases = map[string]string{"a": "b"}'
+    vulnerable = ('name := r.FormValue("name")\nif name, ok := aliases[name]; ok { _ = name }\n'
+                  'db.Query("SELECT * FROM t WHERE n = " + name)')
+    patched = ('name := r.FormValue("name")\nif v, ok := aliases[name]; ok { name = v } else { return }\n'
+               'db.Query("SELECT * FROM t WHERE n = " + name)')
+    _pair("CWE-89", _handler(vulnerable, SQL_IMPORTS, extra), _handler(patched, SQL_IMPORTS, extra))
+
+
+def test_block_shadow_does_not_clean_the_outer_variable():
+    _pair("CWE-78",
+          _handler('p := r.FormValue("p")\n{ p := "ls"; _ = p }\nexec.Command(p)', EX),
+          _handler('p := r.FormValue("p")\n{ p = "ls"; _ = p }\nexec.Command(p)', EX))
+
+
+def test_var_shadow_does_not_clean_the_outer_variable():
+    _pair("CWE-78",
+          _handler('p := r.FormValue("p")\n{ var p = "ls"; _ = p }\nexec.Command(p)', EX),
+          _handler('p := r.FormValue("p")\n{ p = "ls"; _ = p }\nexec.Command(p)', EX))
+
+
+def test_switch_initializer_shadow_does_not_clean_the_outer_variable():
+    _pair("CWE-78",
+          _handler('cmd := r.FormValue("c")\nswitch cmd := "ls"; cmd { default: _ = cmd }\n'
+                   'exec.Command(cmd)', EX),
+          _handler('cmd := r.FormValue("c")\nswitch cmd = "ls"; cmd { default: _ = cmd }\n'
+                   'exec.Command(cmd)', EX))
+
+
+def test_for_initializer_shadow_does_not_clean_the_outer_variable():
+    _pair("CWE-78",
+          _handler('p := r.FormValue("p")\nfor p := ""; p != ""; p = "" { _ = p }\nexec.Command(p)', EX),
+          _handler('p := r.FormValue("p")\nfor p = ""; p != ""; p = "" { _ = p }\nexec.Command(p)', EX))
+
+
+def test_inner_tainted_shadow_does_not_taint_the_outer_variable():
+    _pair("CWE-78",
+          _handler('p := "ls"\n{ p = r.FormValue("p"); _ = p }\nexec.Command(p)', EX),
+          _handler('p := "ls"\n{ p := r.FormValue("p"); _ = p }\nexec.Command(p)', EX))
+
+
+def test_range_shadow_does_not_taint_the_outer_variable():
+    _pair("CWE-78",
+          _handler('p := "ls"\nfor _, p = range r.Form["x"] { _ = p }\nexec.Command(p)', EX),
+          _handler('p := "ls"\nfor _, p := range r.Form["x"] { _ = p }\nexec.Command(p)', EX))
+
+
+def test_type_switch_binding_is_its_own_variable():
+    _pair("CWE-78",
+          _handler('v := "ls"\nvar x any = r.FormValue("q")\n'
+                   'switch v := x.(type) { case string: exec.Command(v) }', EX),
+          _handler('v := "ls"\nvar x any = r.FormValue("q")\n'
+                   'switch v := x.(type) { case string: _ = v }\nexec.Command(v)', EX))
+
+
+def test_func_literal_parameter_does_not_touch_the_outer_variable():
+    _pair("CWE-78",
+          _handler('p := r.FormValue("p")\nf := func(p string) { _ = p }\nf("ls")\nexec.Command(p)', EX),
+          _handler('p := "ls"\nf := func(p string) { _ = p }\nf(r.FormValue("p"))\nexec.Command(p)', EX))
+
+
+def test_guard_on_a_shadow_does_not_sanitize_the_outer_variable():
+    _pair("CWE-22",
+          _handler('f := r.FormValue("f")\n{ f := r.FormValue("g"); if !filepath.IsLocal(f) { return }; _ = f }\n'
+                   'os.ReadFile(f)', FS),
+          _handler('f := r.FormValue("f")\n{ if !filepath.IsLocal(f) { return } }\n'
+                   'os.ReadFile(f)', FS))
+
+
+def test_shadow_of_a_named_result_keeps_the_bare_return():
+    firing = 'func pick(s string) (out string) { out = s; { out := "x"; _ = out }; return }'
+    silent = 'func pick(s string) (out string) { out = "x"; { out := s; _ = out }; return }'
+    body = 'exec.Command(pick(r.FormValue("c")))'
+    _pair("CWE-78", _handler(body, EX, firing), _handler(body, EX, silent))

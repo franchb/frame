@@ -88,6 +88,7 @@ class GoFrontend:
         self._program = Program(language="go", exact_spec_lookup=True)
         self._program.source_files.append(filename)
         self._ident_counter = 0
+        self._shadow_counter = 0
         self._variant_counter = 0
         self._literal_names: Dict[int, str] = {}
         self._literal_counts: Dict[str, int] = {}
@@ -122,7 +123,7 @@ class GoFrontend:
                                   is_alias=self._is_package_alias, text=self._t)
         self._guards = GuardTracker(self._src, self._trust, key_of=self._call_key,
                                     arg_nodes=self._arg_nodes, const_str=self._const_str,
-                                    text=self._t)
+                                    text=self._t, var_of=lambda n: self._sil(self._t(n)))
 
     def _after_lowering(self) -> None:
         apply_same_file_flow(self._program, self._site_callees)
@@ -288,6 +289,28 @@ class GoFrontend:
     def _op(self, node) -> str:
         op = node.child_by_field_name("operator")
         return self._t(op) if op is not None else ""
+
+    def _sil(self, name: str) -> str:
+        """The SIL variable holding the local `name` resolves to (a shadowing
+        declaration has its own); non-locals keep their name."""
+        scope = getattr(self, "_scope", None)
+        return scope.sil_name(name) if scope is not None else name
+
+    def _declare(self, name: str, typ: GoType) -> str:
+        """Declare a local in the current scope and return its SIL name. A
+        redeclaration in the same scope (`a, err := ...; b, err := ...`) reuses
+        the binding; one shadowing a local of an enclosing scope of this
+        procedure gets a fresh `name#k`."""
+        scope = self._scope
+        if name in scope.names:
+            scope.declare(name, typ)
+            return scope.sil.get(name, name)
+        sil = None
+        if scope.shadows_local(name):
+            self._shadow_counter += 1
+            sil = f"{name}#{self._shadow_counter}"
+        scope.declare(name, typ, sil)
+        return sil or name
 
     def _scope_lookup(self, name: str) -> Optional[GoType]:
         scope = getattr(self, "_scope", None)
@@ -465,7 +488,7 @@ class GoFrontend:
             loc=self._loc(node), is_method=is_method,
             class_name=receiver[1].path if receiver else None)
         saved = self._save()
-        self._begin_proc(proc, (outer_scope or Scope()).child())
+        self._begin_proc(proc, Scope(outer_scope or Scope(), proc_root=True))
         for pname, ptype in all_params:
             self._scope.declare(pname, ptype)
         # Named results are locals: they shadow package consts, and a bare
@@ -593,8 +616,11 @@ class GoFrontend:
         values = spec.child_by_field_name("value")
         if values is None:
             for n in names:
-                self._scope.declare(self._t(n), typ)
-                self._add(Assign(loc=self._loc(n), id=PVar(self._t(n)), exp=self._opaque(self._loc(n))))
+                if self._t(n) == "_":
+                    continue
+                sil = self._declare(self._t(n), typ)
+                self._on_assign(sil, None)
+                self._add(Assign(loc=self._loc(n), id=PVar(sil), exp=self._opaque(self._loc(n))))
             return
         self._lower_assign_lists(names, values.named_children, declare=True, declared=typ)
 
@@ -618,7 +644,8 @@ class GoFrontend:
                     or (i == len(lefts) - 1 and self._t(lnode) == "err")
                 exp = self._opaque(self._loc(lnode)) if untainted else value
                 self._assign_target(lnode, exp, declare, typ, rnode if not untainted else None)
-            self._on_multi_assign([self._t(l) for l in lefts], rnode)
+            self._on_multi_assign([self._sil(self._t(l)) if l.type == "identifier" else self._t(l)
+                                   for l in lefts], rnode)
             return
         values = [self._lower_expr(r) for r in rights]      # all RHS first: a, b = b, a
         for lnode, value, rnode in zip(lefts, values, rights):
@@ -632,8 +659,7 @@ class GoFrontend:
             name = self._t(lnode)
             if name == "_":
                 return
-            if declare:
-                self._scope.declare(name, typ)
+            name = self._declare(name, typ) if declare else self._sil(name)
             self._add(Assign(loc=loc, id=PVar(name), exp=value))
             self._on_assign(name, value_node)
         elif t in ("selector_expression", "index_expression"):
@@ -659,7 +685,7 @@ class GoFrontend:
             if node is not None and node.type == "unary_expression":
                 node = node.named_children[-1] if node.named_children else None
         if node is not None and node.type == "identifier" and not self._is_package_alias(node):
-            return self._t(node)
+            return self._sil(self._t(node))
         return None
 
     def _lower_compound_assign(self, node, op: str) -> None:
@@ -859,8 +885,11 @@ class GoFrontend:
             if case.type == "type_case" and alias is not None and alias.named_children and tag_node is not None:
                 ctype = type_of(case.child_by_field_name("type"), self._src, self._env.imports)
                 aname = self._t(alias.named_children[0])
-                self._scope.declare(aname, ctype)
-                self._add(Assign(loc=loc, id=PVar(aname), exp=self._lower_expr(tag_node)))
+                tag_exp = self._lower_expr(tag_node)
+                if aname != "_":
+                    aname = self._declare(aname, ctype)
+                    self._add(Assign(loc=loc, id=PVar(aname), exp=tag_exp))
+                    self._on_assign(aname, None)
             elif case.type == "communication_case":
                 comm = case.child_by_field_name("communication")
                 if comm is not None:
@@ -963,7 +992,8 @@ class GoFrontend:
                     return ExpConst.boolean(name == "true")
                 if name in ("nil", "iota"):
                     return self._opaque(loc)
-            return ExpVar(PVar(name))
+                return ExpVar(PVar(name))
+            return ExpVar(PVar(self._sil(name)))
         if t == "parenthesized_expression":
             return self._lower_expr(node.named_children[0]) if node.named_children else ExpConst.null()
         if t == "call_expression":
