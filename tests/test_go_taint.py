@@ -860,3 +860,58 @@ func loop(n int) int { return loop(n + 1) }'''
 def test_hardcoded_secret_scan_runs_on_go():
     assert "CWE-798" in _cwes('package main\nconst apiKey = "sk_live_51HxQ8rT9vYdZ3kP"\n')
     assert "CWE-798" not in _cwes('package main\nconst greeting = "hello there, friend"\n')
+
+
+# ---- call results: one sanitized input must not launder the others -------------------
+SQLF = '"database/sql"\n"fmt"\n"net/http"\n"strconv"'
+
+
+def test_call_sanitization_is_intersected_over_sprintf_inputs():
+    vulnerable = ('id, _ := strconv.Atoi(r.FormValue("id"))\nname := r.FormValue("n")\n'
+                  'db.Query(fmt.Sprintf("SELECT * FROM t WHERE id=%d AND n=\'%s\'", id, name))')
+    patched = ('id, _ := strconv.Atoi(r.FormValue("id"))\nn, _ := strconv.Atoi(r.FormValue("n"))\n'
+               'db.Query(fmt.Sprintf("SELECT * FROM t WHERE id=%d AND n=%d", id, n))')
+    _pair("CWE-89", _handler(vulnerable, SQLF, "var db *sql.DB"),
+          _handler(patched, SQLF, "var db *sql.DB"))
+
+
+def test_call_sanitization_is_intersected_over_join_inputs():
+    _pair("CWE-22",
+          _handler('a := r.FormValue("a")\n'
+                   'os.ReadFile(filepath.Join(filepath.Base(a), r.FormValue("b")))', FS),
+          _handler('a := r.FormValue("a")\n'
+                   'os.ReadFile(filepath.Join(filepath.Base(a), filepath.Base(r.FormValue("b"))))', FS))
+
+
+def test_call_sanitization_is_intersected_over_unresolved_call_inputs():
+    imports = FS + '\n"example.com/ext"'
+    _pair("CWE-22",
+          _handler('os.ReadFile(ext.Mix(filepath.Base(r.FormValue("a")), r.FormValue("b")))', imports),
+          _handler('os.ReadFile(ext.Mix(filepath.Base(r.FormValue("a")), '
+                   'filepath.Base(r.FormValue("b"))))', imports))
+
+
+def test_call_sanitization_is_intersected_over_same_file_helper_inputs():
+    extra = "func cat(a string, b string) string { return a + b }"
+    _pair("CWE-22",
+          _handler('os.ReadFile(cat(filepath.Base(r.FormValue("a")), r.FormValue("b")))', FS, extra),
+          _handler('os.ReadFile(cat(filepath.Base(r.FormValue("a")), '
+                   'filepath.Base(r.FormValue("b"))))', FS, extra))
+
+
+def test_call_sanitization_is_intersected_with_guarded_inputs():
+    imports = FS + '\n"fmt"'
+    _pair("CWE-22",
+          _handler('d := r.FormValue("d")\nif !filepath.IsLocal(d) { return }\n'
+                   'os.ReadFile(fmt.Sprintf("%s/%s", d, r.FormValue("f")))', imports),
+          _handler('d := r.FormValue("d")\nif !filepath.IsLocal(d) { return }\n'
+                   'f := r.FormValue("f")\nif !filepath.IsLocal(f) { return }\n'
+                   'os.ReadFile(fmt.Sprintf("%s/%s", d, f))', imports))
+
+
+def test_out_param_does_not_keep_the_destinations_old_sanitization():
+    imports = FS + '\n"encoding/json"'
+    _pair("CWE-22",
+          _handler('p := filepath.Base(r.FormValue("p"))\n'
+                   'json.NewDecoder(r.Body).Decode(&p)\nos.ReadFile(p)', imports),
+          _handler('p := filepath.Base(r.FormValue("p"))\nos.ReadFile(p)', imports))

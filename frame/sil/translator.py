@@ -1950,6 +1950,54 @@ class SILTranslator:
             kinds &= set(state.sanitized.get(v, []))
         return (state.get_taint_info(tainted[0]), kinds)
 
+    def _go_call_inputs(self, instr: Call, spec, func_name: str) -> List[str]:
+        """Go: the variables whose taint reaches a call's result, by the same
+        rules _exec_call propagates with (mirrored by _go_summaries._call_inputs)."""
+        args = [self._get_exp_vars(a) for a, _ in instr.args]
+        recv = func_name.rsplit('.', 1)[0] if '.' in func_name else None
+        if spec is None:
+            out = [v for vs in args for v in vs]
+            return out + [recv] if recv else out
+        out: List[str] = []
+        if spec.is_taint_sanitizer() and args:
+            out += args[0]
+        if spec.propagates_taint():
+            for i in spec.taint_propagates:
+                if i < len(args):
+                    out += args[i]
+            if recv and (spec.taint_from_receiver or '.' in func_name):
+                out.append(recv)
+        return out
+
+    def _go_settle_call_sanitization(self, instr: Call, spec, func_name: str,
+                                     state: SymbolicState) -> None:
+        """Go: a call result is sanitized for a kind only if EVERY tainted input
+        reaching it was (plus the call's own sanitizer kinds). The shared
+        propagate_taint unions, so one sanitized argument -- `strconv.Atoi(id)`
+        beside a raw name in a Sprintf -- would launder the others. An out-param
+        destination is assigned this result, so it inherits no stale kinds."""
+        ret_var = str(instr.ret[0])
+        if not state.is_tainted(ret_var):
+            return
+        own = set(spec.is_sanitizer or []) if spec is not None else set()
+        if spec is not None and spec.is_taint_source():
+            kinds: Optional[set] = set()
+        else:
+            if spec is None and self._proc_always_returns_constant(func_name):
+                return
+            kinds = None
+            for v in self._go_call_inputs(instr, spec, func_name):
+                if v != ret_var and state.is_tainted(v):
+                    k = set(state.sanitized.get(v, []))
+                    kinds = k if kinds is None else kinds & k
+            if kinds is None:
+                return
+        kinds |= own
+        if kinds:
+            state.sanitized[ret_var] = sorted(kinds)
+        else:
+            state.sanitized.pop(ret_var, None)
+
     def _go_settle_assign(self, instr: Assign, state: SymbolicState, rhs) -> None:
         """Go: an assignment REPLACES the target's value. The shared
         _exec_assign only adds taint and unions sanitization, which would leave
@@ -2477,6 +2525,9 @@ class SILTranslator:
                         receiver_var = parts[0]
                         if state.is_tainted(receiver_var):
                             state.propagate_taint(receiver_var, ret_var)
+
+        if self._is_go_lang and instr.ret:
+            self._go_settle_call_sanitization(instr, spec, func_name, state)
 
         # Track secure XML parsers
         # xml.sax.make_parser() creates a parser with secure defaults (XXE disabled)
