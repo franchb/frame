@@ -263,3 +263,33 @@ func broken( {
 '''
     p = _prog(src)
     assert "go:ok" in p.procedures
+
+
+def test_method_call_site_resolves_to_callee_summary():
+    src = '''package main
+type Server struct{}
+func (s *Server) H(x string) string { return x }
+func use(s *Server, y string) string { return s.H(y) }'''
+    p = _prog(src)
+    call = next(c for c in _calls(p.procedures["go:use"]) if c.get_full_name().endswith(".H"))
+    assert p.get_spec(call.get_full_name()) is p.procedures["go:Server.H"].spec
+    assert p.procedures["go:Server.H"].spec.taint_propagates == [0]
+
+
+def test_summary_marks_sanitizing_helper_and_constant_helper():
+    src = '''package main
+import "path/filepath"
+func safe(p string) string { return filepath.Base(p) }
+func pick(s string) string { return "static" }'''
+    p = _prog(src)
+    assert p.procedures["go:safe"].spec.is_sanitizer == ["filesystem"]
+    assert p.procedures["go:pick"].spec.taint_propagates == []
+
+
+def test_recursive_procedures_get_conservative_summary():
+    src = '''package main
+func a(s string, n int) string { if n == 0 { return "x" }; return b(s, n-1) }
+func b(s string, n int) string { return a(s, n) }'''
+    p = _prog(src)
+    assert p.procedures["go:a"].spec.taint_propagates == [0, 1]
+    assert p.procedures["go:a"].spec.is_sanitizer == []

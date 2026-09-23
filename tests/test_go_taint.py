@@ -181,3 +181,48 @@ def test_env_and_args_are_not_sources():
 import "os"
 func main() { os.Open(os.Args[1]); os.ReadFile(os.Getenv("F")) }'''
     assert "CWE-22" not in _cwes(src)
+
+
+def test_identity_helper_keeps_taint():
+    src = _handler('exec.Command(identity(r.FormValue("cmd")))',
+                   '"net/http"\n"os/exec"', "func identity(s string) string { return s }")
+    assert "CWE-78" in _cwes(src)
+
+
+def test_sanitizing_helper_clears_only_its_kind():
+    extra = "func safe(p string) string { return filepath.Base(p) }"
+    imports = '"net/http"\n"os"\n"os/exec"\n"path/filepath"'
+    assert "CWE-22" not in _cwes(_handler('os.Open(safe(r.FormValue("f")))', imports, extra))
+    assert "CWE-78" in _cwes(_handler('exec.Command(safe(r.FormValue("f")))', imports, extra))
+
+
+def test_constant_helper_does_not_propagate():
+    src = _handler('os.Open(pick(r.FormValue("f")))', '"net/http"\n"os"',
+                   'func pick(s string) string { return "static.txt" }')
+    assert "CWE-22" not in _cwes(src)
+
+
+def test_helper_that_returns_request_data_is_a_source():
+    src = '''package main
+import ("net/http"; "os/exec")
+func q(w http.ResponseWriter, r *http.Request) string { return r.FormValue("a") }
+func run() { exec.Command(q(nil, nil)) }'''
+    assert "CWE-78" in _cwes(src)
+
+
+def test_tainted_argument_reaches_sink_in_callee():
+    src = _handler('run(r.FormValue("cmd"))', '"net/http"\n"os/exec"',
+                   "func run(c string) { exec.Command(c).Run() }")
+    assert "CWE-78" in _cwes(src)
+
+
+def test_tainted_argument_reaches_sink_in_method_callee():
+    src = _handler('s.run(r.FormValue("cmd"))', '"net/http"\n"os/exec"',
+                   "type S struct{}\nvar s *S\nfunc (x *S) run(c string) { exec.Command(c).Run() }")
+    assert "CWE-78" in _cwes(src)
+
+
+def test_multi_result_helper_keeps_taint():
+    src = _handler('v, _ := id2(r.FormValue("cmd"))\nexec.Command(v)', '"net/http"\n"os/exec"',
+                   "func id2(s string) (string, error) { return s, nil }")
+    assert "CWE-78" in _cwes(src)

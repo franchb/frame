@@ -38,6 +38,7 @@ from frame.sil.frontends._go_env import (
     GoType, UNKNOWN, BUILTIN_TYPES, FileEnv, Scope, build_file_env,
     literal_value, params_of, statements_of, text as node_text, type_of,
 )
+from frame.sil.frontends._go_summaries import apply_same_file_flow
 from frame.sil.specs.go_specs import (
     GO_SPECS, CONST_ARG0_EXEMPT, EMPTY_BUILTINS, FIELD_TYPES,
     HANDLER_REGISTRAR_FUNCS, HANDLER_REGISTRAR_METHODS, LIBRARY_PARAM_TYPES,
@@ -118,7 +119,7 @@ class GoFrontend:
         pass
 
     def _after_lowering(self) -> None:
-        pass
+        apply_same_file_flow(self._program, self._site_callees)
 
     def _on_branch(self, cond_node, truth: bool, node: Node) -> None:
         pass
