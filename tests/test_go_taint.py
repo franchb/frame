@@ -1096,3 +1096,27 @@ def test_variadic_argument_propagates_out_of_callee():
     extra = 'func join(parts ...string) string { s := ""; for _, p := range parts { s += p }; return s }'
     _pair("CWE-78", _handler('exec.Command(join("a", r.FormValue("x")))', EX, extra),
           _handler('exec.Command(join("a", "b"))', EX, extra))
+
+
+def test_source_out_param_over_sanitized_var_fires():
+    # c.ShouldBind(&p) overwrites a sanitized p with a fresh source value.
+    src = '''package main
+import ("github.com/gin-gonic/gin"; "os"; "path/filepath")
+func h(c *gin.Context) {
+	p := filepath.Base(c.Query("f"))
+	c.ShouldBind(&p)
+	os.ReadFile(p)
+}'''
+    patched = '''package main
+import ("github.com/gin-gonic/gin"; "os"; "path/filepath")
+func h(c *gin.Context) {
+	p := filepath.Base(c.Query("f"))
+	os.ReadFile(p)
+}'''
+    _pair("CWE-22", src, patched)
+
+
+def test_source_call_assigned_over_sanitized_var_fires():
+    _pair("CWE-22",
+          _handler('p := filepath.Base(r.FormValue("x"))\np = r.FormValue("p")\nos.Open(p)', FS),
+          _handler('p := r.FormValue("p")\np = filepath.Base(r.FormValue("x"))\nos.Open(p)', FS))

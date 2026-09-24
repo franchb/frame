@@ -79,8 +79,9 @@ phase (see Phase B).
 - `frame/sil/procedure.py`: `Program.exact_spec_lookup` flag (see Spec
   resolution). Default `False`; no other language changes behaviour.
 - `frame/sil/translator.py`: a `_is_go_lang` property and the Go-gated edits
-  listed under Translator gates. Every edit is gated; no other language
-  changes behaviour.
+  listed under Translator gates. Every Go edit is gated; no other language
+  changes behaviour (the two all-language fixes listed there come from
+  upstream, not from this frontend).
 - `frame/sil/scanner.py`: `"go"` branch in `_get_frontend` (honours
   `library_mode`, as the JS frontend does); `.go` in both extension maps
   (around lines 995 and 1877); Go directory-scan exclusions; the LLM candidate
@@ -103,14 +104,19 @@ phase (see Phase B).
     tainted operands' sanitized kinds; an untainted right-hand side clears it.
   - `_exec_prune` constant-folds a literal boolean `ExpConst` condition, so
     the dead successor of `if false` / `if true` is skipped.
-  - `_feasibility_guard` pushes polarity down through `&&` / `||`, so a bare
-    call-result inside a combinator gets the sentinel encoding instead of a
-    spuriously UNSAT edge.
+- Two fixes the Go frontend first carried as Go-gated edits now come from
+  upstream as all-language fixes, and Go uses them unchanged:
+  - `_feasibility_guard` pushes polarity down through `&&` / `||` and encodes
+    constant leaves by truthiness, so a bare call-result inside a combinator
+    gets the sentinel encoding instead of a spuriously UNSAT edge (upstream
+    PR lambdasec/frame#5).
   - `_exec_call` settles a call result's sanitization
-    (`_go_settle_call_sanitization`): the intersection of the sanitized kinds
-    of every tainted input reaching the result (arguments and receiver), plus
-    the call's own sanitizer kinds, so one sanitized argument cannot launder
-    the others; an out-param destination is assigned this result.
+    (`_call_input_sanitization` / `_settle_call_sanitization`): the
+    intersection of the sanitized kinds of every tainted input reaching the
+    result (arguments and receiver, snapshotted before the call, compared
+    through the sink-kind alias map), plus the call's own sanitizer kinds, so
+    one sanitized argument cannot launder the others (upstream PR
+    lambdasec/frame#6).
 
 ### Spec resolution: frontend resolves, lookup is exact
 
