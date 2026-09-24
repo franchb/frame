@@ -1789,7 +1789,10 @@ class FrameScanner:
     _IDENTIFIER_VALUE = re.compile(r'[a-z][a-z0-9]*(?:[-_.][a-z0-9]+)+|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+')
     # Target-name tokens saying the constant describes/locates a secret.
     # `action` / `permission` name an authorization object ("ABAC action
-    # export-certificate-private-key"); `annotation` is the sibling of `label`.
+    # export-certificate-private-key") but only as the LEADING name token,
+    # exact and singular (Go `ActionX` / `PermissionX`); elsewhere they say
+    # where a credential is used (GITHUB_ACTIONS_TOKEN, DEPLOY_ACTION_TOKEN).
+    # `annotation` is the sibling of `label`.
     # Deliberately NOT descriptors: role (DB_ROLE_PASSWORD), event
     # (WEBHOOK_EVENT_SECRET), metric (METRICS_AUTH_TOKEN) -- each commonly
     # names a real credential; scope/route values are not identifier-shaped
@@ -1797,7 +1800,8 @@ class FrameScanner:
     _NAME_DESCRIPTORS = frozenset({
         'env', 'var', 'name', 'field', 'header', 'label', 'type', 'file', 'path',
         'dir', 'prefix', 'suffix', 'param', 'attr', 'column', 'prop',
-        'action', 'permission', 'annotation'})
+        'annotation'})
+    _LEADING_DESCRIPTORS = frozenset({'action', 'permission'})
     # Kubernetes qualified key: DNS subdomain (2+ lowercase labels) + '/' +
     # name, e.g. "csi.storage.k8s.io/node-expand-secret-name".
     _QUALIFIED_KEY = re.compile(
@@ -1858,6 +1862,8 @@ class FrameScanner:
             v = qualified.group('name')
         if not cls._IDENTIFIER_VALUE.fullmatch(v):
             return False
+        if name and name[0] in cls._LEADING_DESCRIPTORS:
+            return True
         if any(tok.rstrip('s') in cls._NAME_DESCRIPTORS for tok in name):
             return True
         grams = {''.join(name[i:j]) for i in range(len(name)) for j in range(i + 1, len(name) + 1)}
