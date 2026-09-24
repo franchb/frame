@@ -1740,6 +1740,13 @@ class FrameScanner:
     #      descriptor token (`..._ENV`, `...Name`, `...Field`, `...Path`, ...),
     #      or every value token echoes a name token / a concatenation of
     #      adjacent name tokens / a structural word (id, name, field, ...).
+    #      A Kubernetes qualified key (`<dns-subdomain>/<name>`, e.g.
+    #      "csi.storage.k8s.io/node-expand-secret-name") is judged by its
+    #      name part under the same tie-to-name test; or
+    #   4. it exactly matches a standard HTTP auth header / scheme name
+    #      ("Authorization", "X-Api-Key", "Bearer", ...; case-insensitive,
+    #      exact match only) and the target is not password-named -- "cookie"
+    #      or "basic" is a plausible weak password.
     # Everything else is reported as before -- human passwords are low
     # entropy by nature ("hunter2pass", "super-secret-key"), so the gate never
     # requires positive evidence of a secret.
@@ -1781,9 +1788,26 @@ class FrameScanner:
     # Identifier-shaped value: lowercase words joined by - _ . , or UPPER_SNAKE.
     _IDENTIFIER_VALUE = re.compile(r'[a-z][a-z0-9]*(?:[-_.][a-z0-9]+)+|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+')
     # Target-name tokens saying the constant describes/locates a secret.
+    # `action` / `permission` name an authorization object ("ABAC action
+    # export-certificate-private-key"); `annotation` is the sibling of `label`.
+    # Deliberately NOT descriptors: role (DB_ROLE_PASSWORD), event
+    # (WEBHOOK_EVENT_SECRET), metric (METRICS_AUTH_TOKEN) -- each commonly
+    # names a real credential; scope/route values are not identifier-shaped
+    # or are already paths; kind is too generic.
     _NAME_DESCRIPTORS = frozenset({
         'env', 'var', 'name', 'field', 'header', 'label', 'type', 'file', 'path',
-        'dir', 'prefix', 'suffix', 'param', 'attr', 'column', 'prop'})
+        'dir', 'prefix', 'suffix', 'param', 'attr', 'column', 'prop',
+        'action', 'permission', 'annotation'})
+    # Kubernetes qualified key: DNS subdomain (2+ lowercase labels) + '/' +
+    # name, e.g. "csi.storage.k8s.io/node-expand-secret-name".
+    _QUALIFIED_KEY = re.compile(
+        r'[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)+/(?P<name>[^/]+)')
+    # Standard HTTP auth header / auth-scheme names (lowercased; exact match).
+    _HTTP_AUTH_NAMES = frozenset({
+        'authorization', 'proxy-authorization', 'www-authenticate', 'proxy-authenticate',
+        'cookie', 'set-cookie', 'x-api-key', 'x-auth-token', 'x-access-token',
+        'x-csrf-token', 'x-xsrf-token', 'bearer', 'basic'})
+    _PASSWORD_WORDS = frozenset({'pass', 'password', 'passwd', 'pwd'})
     # Structural words allowed in a value that otherwise echoes the name.
     _STRUCTURAL_WORDS = frozenset({'id', 'name', 'field', 'ref', 'data'})
 
@@ -1826,9 +1850,14 @@ class FrameScanner:
         v = value.strip()
         if any(p.fullmatch(v) for p in cls._STRICT_NONSECRET_SHAPES):
             return True
+        name = cls._name_tokens(target)
+        if v.lower() in cls._HTTP_AUTH_NAMES:
+            return not any(tok in cls._PASSWORD_WORDS for tok in name)
+        qualified = cls._QUALIFIED_KEY.fullmatch(v)
+        if qualified:
+            v = qualified.group('name')
         if not cls._IDENTIFIER_VALUE.fullmatch(v):
             return False
-        name = cls._name_tokens(target)
         if any(tok.rstrip('s') in cls._NAME_DESCRIPTORS for tok in name):
             return True
         grams = {''.join(name[i:j]) for i in range(len(name)) for j in range(i + 1, len(name) + 1)}
