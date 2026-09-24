@@ -1,17 +1,23 @@
-"""Directory scans must not descend into agent/tool state directories.
+"""Directory scans must not descend into agent worktree copies or similar.
 
 `FrameScanner.scan_directory` used to glob the whole tree with no exclusions
 at all. On a real repository that meant scanning full copies of the project
 sitting under `.claude/worktrees/<branch>/` (Claude Code agent worktrees), so
 every finding showed up once per worktree in addition to the real source.
-Tool/agent state directories (`.claude`, `.git`, IDE config, dependency
-caches, virtualenvs, ...) are not project source and must be skipped by
-default, for every language -- the exclusion is on the directory walk, not
-on any one frontend.
+VCS internals (`.git`), agent worktree copies (`.claude/worktrees`,
+`.cursor/worktrees`, `.worktrees`), IDE config, dependency directories and
+virtualenvs are not project source and must be skipped by default, for every
+language -- the exclusion is on the directory walk, not on any one frontend.
+
+The exclusion is deliberately narrow where a tool's whole state directory
+also holds real, user-authored code: `.claude/hooks/*.py` and skill scripts
+are project source a security scanner should see, so only the `worktrees`
+subdirectory under `.claude`/`.cursor` is excluded, never the bare tool
+directory itself.
 
 These tests were written RED (failing against the old, unfiltered
-`scan_directory`) and are GREEN against the default-exclude behavior added
-alongside them.
+`scan_directory`, or against the earlier too-broad `.claude`/`.cursor`
+exclusion) and are GREEN against the current default-exclude behavior.
 """
 
 import pathlib
@@ -23,10 +29,12 @@ def _scanned_filenames(results):
     return {r.filename for r in results}
 
 
-def test_default_excludes_constant_has_claude_and_git():
-    # The two directories the bug report named explicitly.
-    assert ".claude" in DEFAULT_EXCLUDED_SCAN_DIRS
+def test_default_excludes_constant_has_worktrees_and_git():
+    # `.git` is a plain name; `.claude/worktrees` and `.cursor/worktrees` are
+    # narrowed to the worktrees subdirectory specifically (see module docstring).
     assert ".git" in DEFAULT_EXCLUDED_SCAN_DIRS
+    assert (".claude", "worktrees") in DEFAULT_EXCLUDED_SCAN_DIRS
+    assert (".cursor", "worktrees") in DEFAULT_EXCLUDED_SCAN_DIRS
 
 
 def test_claude_worktree_copy_is_skipped(tmp_path):
@@ -41,6 +49,92 @@ def test_claude_worktree_copy_is_skipped(tmp_path):
     filenames = _scanned_filenames(results)
     assert str(tmp_path / "app.py") in filenames
     assert str(worktree / "app.py") not in filenames
+    assert len(results) == 1
+
+
+def test_cursor_worktree_copy_is_skipped(tmp_path):
+    (tmp_path / "app.py").write_text("x = 1\n")
+    worktree = tmp_path / ".cursor" / "worktrees" / "some-branch"
+    worktree.mkdir(parents=True)
+    (worktree / "app.py").write_text("x = 1\n")
+
+    scanner = FrameScanner(language="python", verify=False)
+    results = scanner.scan_directory(str(tmp_path), "**/*.py")
+
+    filenames = _scanned_filenames(results)
+    assert str(tmp_path / "app.py") in filenames
+    assert str(worktree / "app.py") not in filenames
+    assert len(results) == 1
+
+
+def test_claude_hooks_are_real_source_and_still_scanned(tmp_path):
+    # A blanket `.claude` exclusion would also hide `.claude/hooks/*.py` and
+    # skill scripts, which are real, user-authored project code -- only
+    # `.claude/worktrees` is excluded, never the bare `.claude` directory.
+    (tmp_path / "app.py").write_text("x = 1\n")
+    hooks = tmp_path / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "h.py").write_text("y = 2\n")
+
+    scanner = FrameScanner(language="python", verify=False)
+    results = scanner.scan_directory(str(tmp_path), "**/*.py")
+
+    filenames = _scanned_filenames(results)
+    assert str(tmp_path / "app.py") in filenames
+    assert str(hooks / "h.py") in filenames
+    assert len(results) == 2
+
+
+def test_bare_venv_with_pyvenv_cfg_is_skipped(tmp_path):
+    (tmp_path / "app.py").write_text("x = 1\n")
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    lib = venv / "lib"
+    lib.mkdir()
+    (lib / "site.py").write_text("z = 3\n")
+
+    scanner = FrameScanner(language="python", verify=False)
+    results = scanner.scan_directory(str(tmp_path), "**/*.py")
+
+    filenames = _scanned_filenames(results)
+    assert str(tmp_path / "app.py") in filenames
+    assert str(lib / "site.py") not in filenames
+    assert len(results) == 1
+
+
+def test_bare_venv_without_pyvenv_cfg_is_scanned(tmp_path):
+    # A bare `venv` collides with CPython's stdlib package name and is a
+    # plausible real source directory; without `pyvenv.cfg` it is not
+    # actually a virtualenv, so it must not be excluded.
+    (tmp_path / "app.py").write_text("x = 1\n")
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    (venv / "module.py").write_text("z = 3\n")
+
+    scanner = FrameScanner(language="python", verify=False)
+    results = scanner.scan_directory(str(tmp_path), "**/*.py")
+
+    filenames = _scanned_filenames(results)
+    assert str(tmp_path / "app.py") in filenames
+    assert str(venv / "module.py") in filenames
+    assert len(results) == 2
+
+
+def test_dot_venv_is_skipped_unconditionally(tmp_path):
+    # `.venv` has no naming ambiguity, so it is excluded even without
+    # `pyvenv.cfg` -- unlike the bare `venv` name above.
+    (tmp_path / "app.py").write_text("x = 1\n")
+    dot_venv = tmp_path / ".venv"
+    dot_venv.mkdir()
+    (dot_venv / "module.py").write_text("z = 3\n")
+
+    scanner = FrameScanner(language="python", verify=False)
+    results = scanner.scan_directory(str(tmp_path), "**/*.py")
+
+    filenames = _scanned_filenames(results)
+    assert str(tmp_path / "app.py") in filenames
+    assert str(dot_venv / "module.py") not in filenames
     assert len(results) == 1
 
 
