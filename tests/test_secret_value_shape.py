@@ -54,6 +54,28 @@ _K8S_NONSECRETS = [
     ("bootstrap_token_secret_key", "token-secret"),
 ]
 
+# Further false positives from a real Go codebase and Kubernetes, in Go
+# (camelCase / exported) and other spellings:
+#   - an ABAC action name (the `action` descriptor);
+#   - a standard HTTP auth header / scheme name held by a token-named constant;
+#   - a Kubernetes qualified parameter/annotation key (`<dns-subdomain>/<name>`)
+#     whose name part echoes the target.
+_REAL_CODEBASE_NONSECRETS = [
+    ("actionExportPrivateKey", "export-certificate-private-key"),
+    ("ActionExportPrivateKey", "export-certificate-private-key"),
+    ("ACTION_EXPORT_PRIVATE_KEY", "export-certificate-private-key"),
+    ("authToken", "Authorization"),
+    ("AuthToken", "Authorization"),
+    ("AUTH_TOKEN", "Authorization"),
+    ("auth_token", "Proxy-Authorization"),
+    ("apiKey", "X-Api-Key"),
+    ("auth_token", "X-Auth-Token"),
+    ("secretKey", "Cookie"),
+    ("token", "Bearer"),
+    ("csiNodeExpandSecretKey", "csi.storage.k8s.io/node-expand-secret-name"),
+    ("CSI_NODE_EXPAND_SECRET_KEY", "csi.storage.k8s.io/node-expand-secret-name"),
+]
+
 
 def _secrets(lang, ext, code):
     result = FrameScanner(language=lang, verify=False).scan(code, "t." + ext)
@@ -66,7 +88,7 @@ def _ids(params):
 
 _SCAN_CASES = [(lang, ext, tpl, name, value)
                for (lang, ext, tpl) in _TEMPLATES
-               for (name, value) in _K8S_NONSECRETS]
+               for (name, value) in _K8S_NONSECRETS + _REAL_CODEBASE_NONSECRETS]
 
 
 @pytest.mark.parametrize("lang,ext,tpl,name,value", _SCAN_CASES, ids=_ids(_SCAN_CASES))
@@ -158,6 +180,18 @@ def test_nonsecret_shapes_python(code):
     ('def f():\n    password = "$uperman1"\n', "CWE-259"),
     # ALL-CAPS words not ending in a PEM block type are not a PEM label.
     ('def f():\n    secret_key = "TOP SECRET"\n', "CWE-321"),
+    # Header / auth-scheme names are an exact-match list, not a pattern:
+    # anything longer or different is still a candidate secret.
+    ('def f():\n    password = "Authorization1"\n', "CWE-259"),
+    ('def f():\n    token = "authorization-secret-value"\n', "CWE-798"),
+    ('def f():\n    api_key = "X-Api-Key-123abc"\n', "CWE-798"),
+    # A header / scheme word held by a password-named target is a plausible
+    # weak password, so the header list does not apply there.
+    ('def f():\n    password = "Cookie"\n', "CWE-259"),
+    ('def f():\n    DB_PASSWORD = "basic"\n', "CWE-259"),
+    # A qualified key whose name part does not echo the target still fires.
+    ('def f():\n    secret_key = "example.com/my-app-secret"\n', "CWE-321"),
+    ('def f():\n    password = "corp.example.io/hunter-two"\n', "CWE-259"),
 ])
 def test_secret_shapes_fire_python(code, cwe):
     hits = _secrets("python", "py", code)
@@ -170,6 +204,9 @@ def test_secret_shapes_fire_python(code, cwe):
     ("javascript", "js", 'function f() {\n  const password = "PROD_DB_PASS_2024";\n}\n'),
     ("javascript", "js", 'function f() {\n  const client_secret = "dev-client-secret";\n}\n'),
     ("java", "java", 'class C {\n  void f() {\n    String secret_key = "super-secret-key";\n  }\n}\n'),
+    ("javascript", "js", 'function f() {\n  const password = "Authorization1";\n}\n'),
+    ("java", "java", 'class C {\n  void f() {\n    String password = "Cookie";\n  }\n}\n'),
+    ("javascript", "js", 'function f() {\n  const api_key = "X-Api-Key-123abc";\n}\n'),
 ])
 def test_unrelated_identifier_value_fires_other_languages(lang, ext, code):
     assert _secrets(lang, ext, code), f"missed secret in {code!r} ({lang})"
@@ -197,6 +234,16 @@ def test_unrelated_identifier_value_fires_other_languages(lang, ext, code):
     ("token_key", "token_id"),
     # Accepted cost: a value that only echoes the name stays silent.
     ("secret_key", "secret-key"),
+    ("actionExportPrivateKey", "export-certificate-private-key"),
+    ("PermissionReadSecretKey", "read-secret-key-material"),
+    ("secretKeyAnnotation", "example-operator-rotated-at"),
+    ("authToken", "Authorization"),
+    ("authToken", "authorization"),
+    ("AUTH_TOKEN_HEADER", "WWW-Authenticate"),
+    ("token", "Set-Cookie"),
+    ("token", "  Bearer "),
+    ("csiNodeExpandSecretKey", "csi.storage.k8s.io/node-expand-secret-name"),
+    ("ServiceAccountTokenSecretKey", "kubernetes.io/service-account-token"),
 ])
 def test_classifier_nonsecret(target, value):
     assert FrameScanner._is_nonsecret_value(target, value)
@@ -221,6 +268,15 @@ def test_classifier_nonsecret(target, value):
     ("password", "ADMIN_PASS"), ("password", "pass.word"), ("token", "abc.def.ghi"),
     ("password", "secret.txt"), ("password", "$ecret"), ("password", "$uperman1"),
     ("secret_key", "TOP SECRET"),
+    # Header list: exact match only, and never for password-named targets.
+    ("password", "Authorization1"), ("token", "authorization-secret-value"),
+    ("api_key", "X-Api-Key-123abc"), ("password", "Cookie"), ("dbPassword", "basic"),
+    ("token", "Bearer abc123"),
+    # Descriptor words (plural-stripped) never outweigh a credential prefix.
+    ("GITHUB_ACTIONS_TOKEN", "ghs_short"),
+    # Qualified keys: the name part must still echo the target.
+    ("secret_key", "example.com/my-app-secret"), ("password", "corp.example.io/hunter-two"),
+    ("token", "k8s.io/abc"), ("csiNodeExpandSecretKey", "csi.storage.k8s.io/Node-Secret"),
 ])
 def test_classifier_not_nonsecret(target, value):
     assert not FrameScanner._is_nonsecret_value(target, value)
