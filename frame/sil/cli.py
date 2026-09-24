@@ -47,13 +47,35 @@ def create_parser() -> argparse.ArgumentParser:
         "-l", "--language",
         default="python",
         help="Source language (default: python). Symbolic frontends: python, "
-             "javascript, typescript, java, c, cpp, csharp. Any other language "
-             "(e.g. php, ruby, go) runs LLM-detect only under --ai."
+             "javascript, typescript, java, c, cpp, csharp, go. Any other language "
+             "(e.g. php, ruby, rust) runs LLM-detect only under --ai."
     )
     scan_parser.add_argument(
         "-p", "--pattern",
         default="**/*.py",
         help="Glob pattern for directory scan (default: **/*.py)"
+    )
+    scan_parser.add_argument(
+        "--skip-tests",
+        action="store_true",
+        help="Skip test code by language convention (off by default). Go: *_test.go (always skipped) plus directories test/, tests/, e2e/, testdata/, testing/; Python: test_*.py, *_test.py, conftest.py, test/, tests/; JS/TS: *.test.*, *.spec.*, __tests__/; Java: src/test/; C#: directories containing 'Tests'; C/C++: test/, tests/. Directories are matched below the scan root only; an explicitly named file is always scanned. Applies in addition to the default directory excludes (see --no-default-excludes)."
+    )
+    scan_parser.add_argument(
+        "--exclude-dir",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="Skip directories matching this glob (repeatable; fnmatch, case sensitive). A bare name matches a directory of that name at any depth (e.g. 'vendor', '*_mock'). A pattern containing '/' -- including a trailing '/' or a leading './' -- is anchored at the scan root and excludes that directory's whole subtree; '*' also matches '/' (e.g. 'staging/', 'pkg/*/testing'). Ignored for single-file scans. Applies in addition to the default directory excludes; --no-default-excludes does not turn it off."
+    )
+    scan_parser.add_argument(
+        "--no-default-excludes",
+        action="store_true",
+        help="Directory scans skip agent/tool state and dependency "
+             "directories by default (.git, .claude/worktrees, "
+             ".cursor/worktrees, .worktrees, .idea, .vscode, node_modules, "
+             ".venv, venv [only if it looks like a virtualenv], .tox, "
+             "__pycache__, .mypy_cache, .pytest_cache). Pass this to scan "
+             "them too."
     )
     scan_parser.add_argument(
         "-f", "--format",
@@ -330,7 +352,11 @@ def cmd_scan(args) -> int:
             result = scanner.scan_file(str(target))
             results.append(result)
         else:
-            results = scanner.scan_directory(str(target), args.pattern)
+            exclude_dirs = [] if getattr(args, "no_default_excludes", False) else None
+            results = scanner.scan_directory(
+                str(target), args.pattern, exclude_dirs=exclude_dirs,
+                skip_tests=getattr(args, "skip_tests", False),
+                exclude_patterns=getattr(args, "exclude_dir", None) or ())
     except LLMUnavailableError as e:
         print(f"Error: LLM layer unavailable -- scan aborted (findings NOT reliable): {e}",
               file=sys.stderr)

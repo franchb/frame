@@ -65,6 +65,28 @@ def create_parser() -> argparse.ArgumentParser:
         help="Glob pattern for directory scan (default: **/*.py)"
     )
     scan_parser.add_argument(
+        "--skip-tests",
+        action="store_true",
+        help="Skip test code by language convention (off by default). Go: *_test.go (always skipped) plus directories test/, tests/, e2e/, testdata/, testing/; Python: test_*.py, *_test.py, conftest.py, test/, tests/; JS/TS: *.test.*, *.spec.*, __tests__/; Java: src/test/; C#: directories containing 'Tests'; C/C++: test/, tests/. Directories are matched below the scan root only; an explicitly named file is always scanned. Applies in addition to the default directory excludes (see --no-default-excludes)."
+    )
+    scan_parser.add_argument(
+        "--exclude-dir",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="Skip directories matching this glob (repeatable; fnmatch, case sensitive). A bare name matches a directory of that name at any depth (e.g. 'vendor', '*_mock'). A pattern containing '/' -- including a trailing '/' or a leading './' -- is anchored at the scan root and excludes that directory's whole subtree; '*' also matches '/' (e.g. 'staging/', 'pkg/*/testing'). Ignored for single-file scans. Applies in addition to the default directory excludes; --no-default-excludes does not turn it off."
+    )
+    scan_parser.add_argument(
+        "--no-default-excludes",
+        action="store_true",
+        help="Directory scans skip agent/tool state and dependency "
+             "directories by default (.git, .claude/worktrees, "
+             ".cursor/worktrees, .worktrees, .idea, .vscode, node_modules, "
+             ".venv, venv [only if it looks like a virtualenv], .tox, "
+             "__pycache__, .mypy_cache, .pytest_cache). Pass this to scan "
+             "them too."
+    )
+    scan_parser.add_argument(
         "-f", "--format",
         default="text",
         choices=["text", "json", "sarif"],

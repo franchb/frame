@@ -19,7 +19,7 @@ Usage:
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
+from typing import FrozenSet, Iterable, List, Dict, Optional, Any, Union
 from pathlib import Path
 from enum import Enum
 import json
@@ -28,7 +28,9 @@ import time
 
 from frame.sil.llm_client import LLMUnavailableError
 
+import math
 import re
+from collections import Counter
 from typing import Tuple
 
 from frame.sil.procedure import Program
@@ -402,6 +404,216 @@ def is_generated_source(source_code: str,
     return len(source_code) > limit and "\n" not in source_code
 
 
+_GO_SKIP_DIRS = frozenset({"vendor", "testdata", "third_party"})
+
+# --- Opt-in test-code exclusion (`scan --skip-tests`) -----------------------
+# Chosen per file by its suffix, by each ecosystem's own convention. Directory
+# names are matched exactly against the directories between the scan root and
+# the file (never the root itself or anything above it), so a scan rooted
+# inside a `test/` tree still analyses it.
+_TEST_DIRS_BY_SUFFIX = {
+    # Go: `*_test.go` is always skipped by skip_go_file; these are the
+    # conventional homes of e2e suites, fixtures and test helpers.
+    ".go": frozenset({"test", "tests", "e2e", "testdata", "testing"}),
+    ".py": frozenset({"test", "tests"}),
+    ".c": frozenset({"test", "tests"}), ".h": frozenset({"test", "tests"}),
+    ".cpp": frozenset({"test", "tests"}), ".cc": frozenset({"test", "tests"}),
+    ".cxx": frozenset({"test", "tests"}), ".hpp": frozenset({"test", "tests"}),
+}
+_JS_SUFFIXES = frozenset({".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"})
+
+
+def is_test_path(rel: Path) -> bool:
+    """Is the file at `rel` (relative to the scan root) test code by its
+    language's convention?
+
+    Go: directories `test`, `tests`, `e2e`, `testdata`, `testing`.
+    Python: `test_*.py`, `*_test.py`, `conftest.py`, directories `test`, `tests`.
+    JavaScript / TypeScript: `*.test.*`, `*.spec.*`, directory `__tests__`.
+    Java: anything under a `src/test/` pair of directories (Maven / Gradle).
+    C#: a directory whose name contains `Tests` (e.g. `App.Tests`, `UnitTests`).
+    C / C++: directories `test`, `tests`.
+    """
+    dirs, name = rel.parts[:-1], rel.name
+    suffix = rel.suffix.lower()
+    if any(d in _TEST_DIRS_BY_SUFFIX.get(suffix, ()) for d in dirs):
+        return True
+    if suffix == ".go":
+        return name.endswith("_test.go")
+    if suffix == ".py":
+        return name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py"
+    if suffix in _JS_SUFFIXES:
+        stem_parts = name.split(".")[1:-1]
+        return "__tests__" in dirs or "test" in stem_parts or "spec" in stem_parts
+    if suffix == ".java":
+        return any(a == "src" and b == "test" for a, b in zip(dirs, dirs[1:]))
+    if suffix == ".cs":
+        return any("Tests" in d for d in dirs)
+    return False
+
+
+def is_excluded_dir(rel: Path, patterns) -> bool:
+    """Does a directory on the way from the scan root to `rel` match one of the
+    `--exclude-dir` globs (fnmatch, case sensitive)?
+
+    * A bare name (no `/`), e.g. `vendor` or `*_mock`, matches a directory of
+      that name at any depth.
+    * A pattern containing `/` -- including a trailing one (`staging/`) or a
+      leading `./` (`./staging`) -- is anchored at the scan root and matched
+      against each directory's root-relative path, so it excludes that
+      directory's whole subtree. `*` also matches `/` (`pkg/*/testing`).
+    """
+    import fnmatch
+    dirs = rel.parts[:-1]
+    paths = ["/".join(dirs[:i + 1]) for i in range(len(dirs))]
+    for raw in patterns or ():
+        pat = raw.strip().replace("\\", "/")
+        anchored = "/" in pat
+        while pat.startswith("./"):
+            pat = pat[2:]
+        pat = pat.strip("/")
+        if not pat or pat == ".":
+            continue
+        if anchored:
+            if any(fnmatch.fnmatchcase(p, pat) for p in paths):
+                return True
+        elif any(fnmatch.fnmatchcase(d, pat) for d in dirs):
+            return True
+    return False
+
+
+def is_path_excluded(rel: Path, skip_tests: bool = False, exclude_dirs=()) -> bool:
+    """The directory-scan filter for `--skip-tests` / `--exclude-dir`, on a path
+    relative to the scan root."""
+    return bool((exclude_dirs and is_excluded_dir(rel, exclude_dirs))
+                or (skip_tests and is_test_path(rel)))
+
+
+_GO_GENERATED_HEADER = re.compile(r"^// Code generated .* DO NOT EDIT\.\s*$", re.MULTILINE)
+
+
+def skip_go_file(path: Path, root: Path) -> bool:
+    """Go files a directory scan leaves out: vendored, test-data and
+    third-party trees, tests, and generated code (the standard `// Code
+    generated ... DO NOT EDIT.` header, with common generated filenames as a
+    fast path). None of them is the project's attack surface, and in
+    Kubernetes-scale repositories they dominate the file count."""
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        parts = path.parts
+    if any(p in _GO_SKIP_DIRS for p in parts[:-1]):
+        return True
+    name = path.name
+    if (name.endswith("_test.go") or name.endswith(".pb.go")
+            or name.startswith("zz_generated") or name.endswith("_mock.go")):
+        return True
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8192)
+    except OSError:
+        return False
+    # utf-8-sig strips a leading BOM so it never shifts line 1 into the marker
+    # search.
+    text = head.decode("utf-8-sig", errors="replace")
+    # Go's convention: the generated-code marker is only meaningful in the
+    # leading comment block, before the first non-comment, non-blank line
+    # (conventionally `package ...`). Searching the whole file would also
+    # match the same text sitting in a string literal or a later comment,
+    # which is real source -- e.g. a generator's own code that prints the
+    # marker -- not a generator's output. `/* ... */` block comments (the
+    # common license-header shape, e.g. Kubernetes generated files) are part
+    # of that leading run too and must be skipped over, not treated as the
+    # end of it.
+    leading_comments = []
+    in_block = False
+    for line in text.splitlines():
+        if in_block:
+            end = line.find("*/")
+            if end == -1:
+                continue
+            in_block = False
+            line = line[end + 2:]
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("//"):
+            leading_comments.append(line)
+            continue
+        if stripped.startswith("/*"):
+            end = stripped.find("*/", 2)
+            if end == -1:
+                in_block = True
+                continue
+            # Single-line block comment; keep scanning the rest of the file.
+            continue
+        break
+    return _GO_GENERATED_HEADER.search("\n".join(leading_comments)) is not None
+
+
+# Directory names (or component sequences) skipped by default during a
+# directory scan, for every language -- the exclusion happens on the file
+# walk, before any frontend sees a path. An entry is either a single
+# component (matches that name anywhere) or a tuple of components that must
+# appear consecutively (see `FrameScanner._is_excluded_dir_member`). None of
+# these hold project source in the common case:
+#   - .git                          VCS internals.
+#   - (".claude", "worktrees"),
+#     (".cursor", "worktrees")      Agent worktree copies specifically, not
+#                                   the tool's whole state directory:
+#                                   `.claude/worktrees/<branch>/` holds a full
+#                                   copy of the repository that a Claude Code
+#                                   agent works in, and scanning it multiplies
+#                                   every finding once per worktree. A bare
+#                                   `.claude` exclusion would also hide
+#                                   `.claude/hooks/*.py` and skill scripts,
+#                                   which are real, user-authored project
+#                                   code a security scanner should see -- so
+#                                   only the `worktrees` subdirectory is
+#                                   excluded, not the whole tool state dir.
+#   - .worktrees                    Same shape (a tool's own worktree
+#                                   copies), for tools that keep it at the
+#                                   repo root instead of nested under their
+#                                   own state directory.
+#   - .idea, .vscode                IDE project configuration, not source.
+#   - node_modules                  Vendored JS dependencies -- someone
+#                                   else's code.
+#   - .venv, .tox                   Python virtualenvs. These can contain
+#                                   thousands of third-party `.py` files,
+#                                   which is exactly the "full copy that
+#                                   isn't project source" problem.
+#   - venv                          Same shape, but the bare name collides
+#                                   with CPython's stdlib `venv` package and
+#                                   is a plausible real source directory
+#                                   name, so it is excluded conditionally:
+#                                   only when the directory actually
+#                                   contains `pyvenv.cfg`, the marker every
+#                                   `venv`/`virtualenv`-created environment
+#                                   carries (see `_is_excluded_dir_member`).
+#   - __pycache__                   Python bytecode cache.
+#   - .mypy_cache, .pytest_cache    Tool caches, not source.
+#
+# Matching is on path components relative to the scan root (see
+# `scan_directory`), so a scan root that itself sits inside one of these
+# directories still scans normally -- only descendants named like this are
+# skipped.
+DEFAULT_EXCLUDED_SCAN_DIRS: FrozenSet[Union[str, Tuple[str, ...]]] = frozenset({
+    ".git",
+    (".claude", "worktrees"),
+    (".cursor", "worktrees"),
+    ".worktrees",
+    ".idea",
+    ".vscode",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".tox",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+})
+
+
 class FrameScanner:
     """
     Main vulnerability scanner.
@@ -736,6 +948,11 @@ class FrameScanner:
         elif language == "csharp":
             from frame.sil.frontends.csharp_frontend import CSharpFrontend
             return CSharpFrontend()
+        elif language == "go":
+            from frame.sil.frontends.go_frontend import GoFrontend
+            fe = GoFrontend()
+            fe.taint_exported_params = self.library_mode
+            return fe
         else:
             # No symbolic frontend for this language. Return None rather than raise:
             # under --ai the scan still runs the language-agnostic LLM-detect layer
@@ -782,6 +999,12 @@ class FrameScanner:
             result.scan_time_ms = (time.time() - start_time) * 1000
             return result
 
+        program = None
+        # Set True the moment step 7 (normal-path LLM detect) starts, even if
+        # it goes on to raise -- tells the except-path bypass below whether
+        # detect already ran, so it never re-runs it (a duplicate paid LLM
+        # call whose findings would also bypass step 8's triage).
+        detect_ran = False
         try:
             # Step 1: Parse source to SIL
             if self.verbose:
@@ -789,6 +1012,7 @@ class FrameScanner:
 
             program = self.frontend.translate(source_code, filename)
             result.procedures_analyzed = len(program.procedures)
+            result.warnings.extend(getattr(program, "warnings", None) or [])
 
             if self.verbose:
                 print(f"[Scanner] Found {len(program.procedures)} procedures")
@@ -850,6 +1074,7 @@ class FrameScanner:
             # missed (recall). Runs BEFORE triage so that, when both are enabled,
             # triage also filters the (noisier) detection findings.
             if self.llm_detect:
+                detect_ran = True
                 result.vulnerabilities = self._apply_llm_detect(
                     result.vulnerabilities, source_code, filename, program)
                 if self.verbose:
@@ -872,6 +1097,30 @@ class FrameScanner:
             if self.verbose:
                 import traceback
                 traceback.print_exc()
+            # Go: a file that crashes the symbolic layer (e.g. a very long `+`
+            # chain hitting __str__ recursion) keeps the --ai detection pass it
+            # had before the frontend existed. Gated so other languages keep
+            # their current behaviour. Only run it here if step 7 never got a
+            # chance to (crash happened earlier) -- if step 7 already ran (and
+            # either it or step 8's triage is what raised), re-running detect
+            # here would be a duplicate paid LLM call whose findings also
+            # bypass triage. And this call gets its own try/except: detect can
+            # itself raise on a malformed LLM response (_apply_llm_detect only
+            # guards ImportError), and that must be recorded as a scan error
+            # rather than escaping scan().
+            if self.llm_detect and self.language == "go" and not detect_ran:
+                try:
+                    result.vulnerabilities = self._apply_llm_detect(
+                        result.vulnerabilities, source_code, filename, program)
+                except LLMUnavailableError:
+                    # Same rule as the outer handler above: an unreachable LLM
+                    # must propagate, not be swallowed into a "clean" scan --
+                    # the CLI depends on this to report "LLM layer unavailable"
+                    # and exit non-zero instead of silently returning no
+                    # findings.
+                    raise
+                except Exception as e2:
+                    result.errors.append(f"LLM detect error: {str(e2)}")
 
         result.scan_time_ms = (time.time() - start_time) * 1000
 
@@ -923,7 +1172,11 @@ class FrameScanner:
         # model on every file). For an unsupported language (LLM-only mode) the user
         # explicitly opted in with --ai, so detection always runs -- the heuristic's
         # patterns are tuned for the symbolic languages and would miss PHP/Ruby/etc.
-        if self.frontend is not None and not is_detection_candidate(source_code, bool(vulns)):
+        # Go keeps the always-run behaviour it had before its frontend existed:
+        # the candidate patterns are tuned for the other languages and would
+        # silently drop Go files with no symbolic finding from the LLM pass.
+        if (self.frontend is not None and self.language != "go"
+                and not is_detection_candidate(source_code, bool(vulns))):
             return vulns
         if self._llm_client is None:
             self._llm_client = LLMTriageClient(config)
@@ -999,6 +1252,7 @@ class FrameScanner:
             '.cxx': 'cpp',
             '.hpp': 'cpp',
             '.cs': 'csharp',
+            '.go': 'go',
         }
         detected_lang = ext_to_lang.get(path.suffix.lower(), self.language)
 
@@ -1008,7 +1262,11 @@ class FrameScanner:
             self.frontend = self._get_frontend(detected_lang)
 
         # Use utf-8-sig to automatically strip BOM (common in C# files)
-        source_code = path.read_text(encoding='utf-8-sig')
+        # Go sources in the wild carry the odd invalid byte in comments or
+        # string literals; tree-sitter recovers, so decode with replacement
+        # rather than failing the whole file.
+        errors = "replace" if path.suffix.lower() == ".go" else "strict"
+        source_code = path.read_text(encoding='utf-8-sig', errors=errors)
 
         # Minified and generated artifacts are not source: they are build output,
         # they are never the file a security advisory points at, and analysing them
@@ -1023,19 +1281,93 @@ class FrameScanner:
 
         return self.scan(source_code, str(path))
 
-    def scan_directory(self, dirpath: str, pattern: str = "**/*.py") -> List[ScanResult]:
+    @staticmethod
+    def _is_excluded_dir_member(
+            filepath: Path, root: Path,
+            excluded_dirs: FrozenSet[Union[str, Tuple[str, ...]]]) -> bool:
+        """Does `filepath` sit under one of `excluded_dirs`, relative to `root`?
+
+        Only directory components between `root` and the file are checked --
+        never the filename itself, and never anything above `root` -- so a
+        scan root that itself happens to be named (or nested in) an excluded
+        directory still has its own files scanned normally.
+
+        An entry in `excluded_dirs` is either a plain string, matched against
+        any single directory component, or a tuple of components that must
+        appear consecutively (e.g. `(".claude", "worktrees")` matches
+        `.claude/worktrees/...` but not a bare `.claude/hooks/...`).
+
+        The single name `"venv"` is a special case: it collides with
+        CPython's own `venv` stdlib package and is a plausible real source
+        directory name, so it only counts as a virtualenv -- and is only
+        excluded -- when it actually contains `pyvenv.cfg`, the marker every
+        `venv`/`virtualenv`-created environment carries. `.venv` has no such
+        ambiguity and is excluded unconditionally.
+        """
+        if not excluded_dirs:
+            return False
+        try:
+            rel_parts = filepath.relative_to(root).parts
+        except ValueError:
+            # Not actually under `root` (e.g. a differently-resolved symlink) --
+            # conservative default is to scan it, never to inspect components
+            # above `root` that this guarantee was never meant to cover.
+            return False
+        dir_parts = rel_parts[:-1]  # drop the filename: only dirs can match
+        if not dir_parts:
+            return False
+
+        single = {e for e in excluded_dirs if isinstance(e, str)}
+        multi = [e for e in excluded_dirs if isinstance(e, tuple) and e]
+
+        for i, part in enumerate(dir_parts):
+            if part not in single:
+                continue
+            if part == "venv":
+                venv_dir = root.joinpath(*dir_parts[:i + 1])
+                if not (venv_dir / "pyvenv.cfg").is_file():
+                    continue
+            return True
+
+        for seq in multi:
+            n = len(seq)
+            for i in range(len(dir_parts) - n + 1):
+                if tuple(dir_parts[i:i + n]) == seq:
+                    return True
+        return False
+
+    def scan_directory(self, dirpath: str, pattern: str = "**/*.py",
+                        exclude_dirs: Optional[Iterable[Union[str, Tuple[str, ...]]]] = None, *,
+                        skip_tests: bool = False,
+                        exclude_patterns: Iterable[str] = ()) -> List[ScanResult]:
         """
         Scan all matching files in a directory.
 
         Args:
             dirpath: Directory path
             pattern: Glob pattern for files
+            exclude_dirs: Directory names (or component-sequence tuples) to
+                skip anywhere under `dirpath` (matched against path
+                components relative to `dirpath`, so a scan root that itself
+                sits inside such a directory is not affected). Defaults to
+                `DEFAULT_EXCLUDED_SCAN_DIRS` -- VCS/IDE/dependency/build
+                state such as `.git` and `.claude/worktrees` that is not
+                project source in the common case. Pass `[]` to disable
+                filtering.
+            skip_tests: Leave out test code by each language's convention
+                (see is_test_path). Off by default. Applies in addition to
+                `exclude_dirs`.
+            exclude_patterns: `--exclude-dir` globs for directories to leave
+                out (see is_excluded_dir), matched relative to dirpath.
+                Applies in addition to `exclude_dirs`.
 
         Returns:
             List of ScanResult for each file
         """
         results = []
         dir_path = Path(dirpath)
+        excluded_dirs = (DEFAULT_EXCLUDED_SCAN_DIRS if exclude_dirs is None
+                          else frozenset(exclude_dirs))
 
         # The agentic detector can trace flows across files with its read_file and
         # grep tools, but only when it has a repo root; without one it silently
@@ -1055,25 +1387,46 @@ class FrameScanner:
 
         try:
             for filepath in dir_path.glob(pattern):
-                if filepath.is_file():
-                    result = self.scan_file(str(filepath))
-                    results.append(result)
+                if not filepath.is_file():
+                    continue
+                if self._is_excluded_dir_member(filepath, dir_path, excluded_dirs):
+                    continue
+                if skip_tests or exclude_patterns:
+                    try:
+                        rel = filepath.relative_to(dir_path)
+                    except ValueError:
+                        rel = Path(filepath.name)
+                    if is_path_excluded(rel, skip_tests, exclude_patterns):
+                        continue
+                if filepath.suffix.lower() == ".go" and skip_go_file(filepath, dir_path):
+                    continue
+                result = self.scan_file(str(filepath))
+                results.append(result)
         finally:
             self.llm_detect = per_file_detect
 
         if repo_scale:
-            results = self._apply_repo_scale_detect(dir_path, results)
+            results = self._apply_repo_scale_detect(
+                dir_path, results, excluded_dirs,
+                skip_tests=skip_tests, exclude_patterns=exclude_patterns)
 
         return results
 
     def _apply_repo_scale_detect(self, dir_path: Path,
-                                 results: List[ScanResult]) -> List[ScanResult]:
+                                 results: List[ScanResult],
+                                 excluded_dirs: FrozenSet[Union[str, Tuple[str, ...]]] = frozenset(), *,
+                                 skip_tests: bool = False,
+                                 exclude_patterns: Iterable[str] = ()) -> List[ScanResult]:
         """Run one repository-wide LLM detection pass and merge its findings.
 
         Findings are attached to the ScanResult for the file they name, creating one
         if the file was not otherwise scanned (the model may legitimately flag a file
-        the glob did not match). Fail-safe: any error leaves the symbolic results
-        untouched, because a broken LLM tier must never discard proven findings.
+        the glob did not match). That legitimate case is exactly how an excluded
+        directory could sneak back in: the agent's own read_file/grep tools are not
+        limited to the glob's matches, so a newly-created result is still checked
+        against `excluded_dirs` before being kept. Fail-safe: any error leaves the
+        symbolic results untouched, because a broken LLM tier must never discard
+        proven findings.
         """
         try:
             from frame.sil.llm_detect import detect_repo
@@ -1086,8 +1439,19 @@ class FrameScanner:
                 if self.verbose:
                     print("[Scanner] repo-scale detect requested but no endpoint/model.")
                 return results
-            root = str(dir_path.resolve())
-            found = detect_repo(root, self.language, config, self._llm_client)
+            resolved_root = dir_path.resolve()
+            root = str(resolved_root)
+            keep = None
+            if skip_tests or exclude_patterns:
+                # --skip-tests / --exclude-dir: excluded files never enter the
+                # model's inventory (nor use up its cap), and a finding it
+                # still reports in one is dropped below.
+                def keep(rel: str) -> bool:
+                    return not is_path_excluded(Path(rel), skip_tests, exclude_patterns)
+                found = detect_repo(root, self.language, config, self._llm_client,
+                                    path_filter=keep)
+            else:
+                found = detect_repo(root, self.language, config, self._llm_client)
         except Exception as e:
             if self.verbose:
                 print(f"[Scanner] repo-scale detect failed: {e}")
@@ -1096,8 +1460,25 @@ class FrameScanner:
         by_file = {r.filename: r for r in results}
         for vuln in found or []:
             target = getattr(vuln, "location", "") or ""
+            if not target:
+                continue
+            if keep is not None:
+                try:
+                    rel = Path(target).resolve().relative_to(root)
+                except (ValueError, OSError):
+                    rel = None
+                if rel is not None and not keep(rel.as_posix()):
+                    if self.verbose:
+                        print(f"[Scanner] repo-scale finding dropped, "
+                              f"path is excluded by --skip-tests/--exclude-dir: {target}")
+                    continue
             result = by_file.get(target)
             if result is None:
+                if self._is_excluded_dir_member(Path(target), resolved_root, excluded_dirs):
+                    if self.verbose:
+                        print(f"[Scanner] repo-scale finding dropped, "
+                              f"path is under an excluded directory: {target}")
+                    continue
                 result = ScanResult(filename=target)
                 by_file[target] = result
                 results.append(result)
@@ -1497,6 +1878,152 @@ class FrameScanner:
         'xxx', 'xxxx', 'todo', 'none', 'null', 'example', 'test', 'placeholder',
     }
 
+    # Value-shape gate for the name-based rules (Rule A). The target name only
+    # says the variable is *about* a credential; constants such as
+    # `SSH_AUTH_PRIVATE_KEY = "ssh-privatekey"` (a secret's field name),
+    # `SA_PRIVATE_KEY_NAME = "sa.key"` (a filename) or
+    # `EC_PRIVATE_KEY_BLOCK_TYPE = "EC PRIVATE KEY"` (a PEM label) hold no
+    # secret. A literal is suppressed only when, in order:
+    #   1. it is NOT key material and carries no known credential prefix
+    #      (veto: such values are always reported);
+    #   2. it has a strict non-secret shape: PEM block-type label, bare PEM
+    #      armor line, key/cert filename, filesystem path, or placeholder; or
+    #   3. it is identifier-shaped (lowercase words joined by - _ . or
+    #      UPPER_SNAKE) AND tied to the target name: the name carries a
+    #      descriptor token (`..._ENV`, `...Name`, `...Field`, `...Path`, ...),
+    #      or every value token echoes a name token / a concatenation of
+    #      adjacent name tokens / a structural word (id, name, field, ...).
+    #      A Kubernetes qualified key (`<dns-subdomain>/<name>`, e.g.
+    #      "csi.storage.k8s.io/node-expand-secret-name") is judged by its
+    #      name part under the same tie-to-name test; or
+    #   4. it exactly matches a standard HTTP auth header / scheme name
+    #      ("Authorization", "X-Api-Key", "Bearer", ...; case-insensitive,
+    #      exact match only) and the target is not password-named -- "cookie"
+    #      or "basic" is a plausible weak password.
+    # Everything else is reported as before -- human passwords are low
+    # entropy by nature ("hunter2pass", "super-secret-key"), so the gate never
+    # requires positive evidence of a secret.
+    # Literal values arrive with escapes unprocessed (a "\n" in source is the
+    # two characters backslash + n), so newline matching accepts both forms.
+    _PEM_WITH_BODY = re.compile(
+        r'-----BEGIN [A-Z0-9 ]+-----(?:(?!-----END).){0,512}?[A-Za-z0-9+/]{16,}', re.DOTALL)
+    _KNOWN_CREDENTIAL = re.compile(
+        r'\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[0-9A-Z]{16}\b'   # AWS access key id
+        r'|\bgh[pousr]_[A-Za-z0-9]{36,}'                                 # GitHub token
+        r'|\bgithub_pat_[A-Za-z0-9_]{22,}'                               # GitHub fine-grained PAT
+        r'|\bglpat-[A-Za-z0-9_-]{20,}'                                   # GitLab PAT
+        r'|\bxox[baprs]-[A-Za-z0-9-]{10,}'                               # Slack token
+        r'|\bAIza[0-9A-Za-z_-]{35}'                                      # Google API key
+        r'|\b[sr]k_(?:live|test)_[0-9A-Za-z]{16,}'                       # Stripe secret key
+        r'|\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}'  # JWT
+    )
+    # Credential prefixes at any length: a value carrying one is never
+    # suppressed, even when too short to be a full-format token.
+    _CREDENTIAL_PREFIX = re.compile(
+        r'\b(?:[srp]k_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|SG\.)'
+        r'|\b(?:AKIA|ASIA|AIza|eyJ)')
+    _HEX_BLOB = re.compile(r'[0-9a-f]{32,}|[0-9A-F]{32,}')
+    _TOKEN_CHARS = re.compile(r'[A-Za-z0-9+/=_\-.~]+')
+    _STRICT_NONSECRET_SHAPES = [
+        # PEM block type label ("EC PRIVATE KEY", "CERTIFICATE REQUEST").
+        re.compile(r'(?:[A-Z][A-Z0-9]* )+(?:KEY|CERTIFICATE|REQUEST|CRL|PARAMETERS|PKCS7|CMS|SIGNATURE)'),
+        # PEM armor line with no body ("-----BEGIN RSA PRIVATE KEY-----").
+        re.compile(r'-----(?:BEGIN|END) [A-Z0-9 ]+-----(?:\s|\\[nr])*'),
+        # Key / certificate filename ("sa.key", "tls.crt").
+        re.compile(r'(?i)[\w.-]+\.(?:key|pem|crt|cer|csr|der|p8|p12|pfx|jks|keystore|pub|'
+                   r'kdbx|asc|gpg)'),
+        # Filesystem path ("/etc/kubernetes/pki/sa.key", "./certs", "~/.ssh/id_rsa").
+        re.compile(r'(?:~|\.{1,2})?/[\w.\-/]*'),
+        # Placeholders ("<your-secret-key>", "********", "xxxx", "$SECRET",
+        # "${SECRET}", "$(cat key)").
+        re.compile(r'<[^<>]+>|\*+|(?i:x+)|\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\$\(.*\)'),
+    ]
+    # Identifier-shaped value: lowercase words joined by - _ . , or UPPER_SNAKE.
+    _IDENTIFIER_VALUE = re.compile(r'[a-z][a-z0-9]*(?:[-_.][a-z0-9]+)+|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+')
+    # Target-name tokens saying the constant describes/locates a secret.
+    # `action` / `permission` name an authorization object ("ABAC action
+    # export-certificate-private-key") but only as the LEADING name token,
+    # exact and singular (Go `ActionX` / `PermissionX`); elsewhere they say
+    # where a credential is used (GITHUB_ACTIONS_TOKEN, DEPLOY_ACTION_TOKEN).
+    # `annotation` is the sibling of `label`.
+    # Deliberately NOT descriptors: role (DB_ROLE_PASSWORD), event
+    # (WEBHOOK_EVENT_SECRET), metric (METRICS_AUTH_TOKEN) -- each commonly
+    # names a real credential; scope/route values are not identifier-shaped
+    # or are already paths; kind is too generic.
+    _NAME_DESCRIPTORS = frozenset({
+        'env', 'var', 'name', 'field', 'header', 'label', 'type', 'file', 'path',
+        'dir', 'prefix', 'suffix', 'param', 'attr', 'column', 'prop',
+        'annotation'})
+    _LEADING_DESCRIPTORS = frozenset({'action', 'permission'})
+    # Kubernetes qualified key: DNS subdomain (2+ lowercase labels) + '/' +
+    # name, e.g. "csi.storage.k8s.io/node-expand-secret-name".
+    _QUALIFIED_KEY = re.compile(
+        r'[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)+/(?P<name>[^/]+)')
+    # Standard HTTP auth header / auth-scheme names (lowercased; exact match).
+    _HTTP_AUTH_NAMES = frozenset({
+        'authorization', 'proxy-authorization', 'www-authenticate', 'proxy-authenticate',
+        'cookie', 'set-cookie', 'x-api-key', 'x-auth-token', 'x-access-token',
+        'x-csrf-token', 'x-xsrf-token', 'bearer', 'basic'})
+    _PASSWORD_WORDS = frozenset({'pass', 'password', 'passwd', 'pwd'})
+    # Structural words allowed in a value that otherwise echoes the name.
+    _STRUCTURAL_WORDS = frozenset({'id', 'name', 'field', 'ref', 'data'})
+
+    @staticmethod
+    def _name_tokens(target: str) -> List[str]:
+        """Split an identifier on camelCase and separators, lowercased:
+        'SSHAuthPrivateKey' -> ['ssh', 'auth', 'private', 'key']."""
+        t = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', target)
+        t = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', t)
+        return [x for x in re.split(r'[^A-Za-z0-9]+', t.lower()) if x]
+
+    @staticmethod
+    def _shannon_entropy(value: str) -> float:
+        n = len(value)
+        return -sum(c / n * math.log2(c / n) for c in Counter(value).values())
+
+    @classmethod
+    def _is_key_material(cls, value: str) -> bool:
+        """Unambiguous secret: a PEM block with a base64 body, a known
+        credential format, or a high-entropy token (16+ non-whitespace token
+        chars; 32+ hex, or upper + lower + digit with Shannon entropy >= 3.5
+        bits/char)."""
+        if cls._PEM_WITH_BODY.search(value) or cls._KNOWN_CREDENTIAL.search(value):
+            return True
+        if len(value) < 16 or not cls._TOKEN_CHARS.fullmatch(value):
+            return False
+        if cls._HEX_BLOB.fullmatch(value):
+            return True
+        classes = (any(c.islower() for c in value) + any(c.isupper() for c in value)
+                   + any(c.isdigit() for c in value))
+        return classes == 3 and cls._shannon_entropy(value) >= 3.5
+
+    @classmethod
+    def _is_nonsecret_value(cls, target: str, value: str) -> bool:
+        """True when the literal bound to credential-named `target` names,
+        labels or locates a secret rather than being one (see the rule
+        comment above). Key material and credential prefixes always veto."""
+        if cls._is_key_material(value) or cls._CREDENTIAL_PREFIX.search(value):
+            return False
+        v = value.strip()
+        if any(p.fullmatch(v) for p in cls._STRICT_NONSECRET_SHAPES):
+            return True
+        name = cls._name_tokens(target)
+        if v.lower() in cls._HTTP_AUTH_NAMES:
+            return not any(tok in cls._PASSWORD_WORDS for tok in name)
+        qualified = cls._QUALIFIED_KEY.fullmatch(v)
+        if qualified:
+            v = qualified.group('name')
+        if not cls._IDENTIFIER_VALUE.fullmatch(v):
+            return False
+        if name and name[0] in cls._LEADING_DESCRIPTORS:
+            return True
+        if any(tok.rstrip('s') in cls._NAME_DESCRIPTORS for tok in name):
+            return True
+        grams = {''.join(name[i:j]) for i in range(len(name)) for j in range(i + 1, len(name) + 1)}
+        vals = [x for x in re.split(r'[-_.]', v.lower()) if x]
+        return (any(x in grams for x in vals)
+                and all(x in grams or x in cls._STRUCTURAL_WORDS for x in vals))
+
     def _scan_literals(self, program: Program, filename: str) -> List[Vulnerability]:
         """Tier-2 structural scan over the SIL for hardcoded secrets (CWE-798/
         259/321): a credential-named assignment target bound to a literal string.
@@ -1522,11 +2049,13 @@ class FrameScanner:
                         continue
 
                     cwe = label = None
-                    # Rule A: credential-named target bound to a literal.
-                    for pattern, c, lbl in self._SECRET_NAME_RULES:
-                        if pattern.search(target):
-                            cwe, label = c, lbl
-                            break
+                    # Rule A: credential-named target bound to a literal whose
+                    # value is not merely a name/label/filename for a secret.
+                    if not self._is_nonsecret_value(target, value):
+                        for pattern, c, lbl in self._SECRET_NAME_RULES:
+                            if pattern.search(target):
+                                cwe, label = c, lbl
+                                break
                     # Rule B: value embeds a credential (e.g. connection string
                     # "...;Password=secret;..."), regardless of the target name.
                     if cwe is None and self._CONNSTR_SECRET.search(value):
@@ -1881,6 +2410,7 @@ def scan_file(filepath: str, language: str = None) -> ScanResult:
             ".h": "c",
             ".hpp": "cpp",
             ".cs": "csharp",
+            ".go": "go",
         }
         language = language_map.get(ext, "python")
 

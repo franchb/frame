@@ -68,7 +68,7 @@ the LLM layer, so `--ai` (and an LLM endpoint) is required for a full run.
 
 | Ecosystem | Tasks | Frame symbolic core |
 |-----------|------:|---------------------|
-| go | 215 | no, LLM layer only |
+| go | 215 | yes (taint + CWE-770); rest LLM-only |
 | maven (Java) | 104 | yes |
 | npm (JS/TS) | 88 | yes |
 | pip (Python) | 52 | yes |
@@ -105,3 +105,32 @@ score relative to the published full-set numbers.
   input validation, 45) is not a taint-analysis class. Roughly a quarter of tasks
   map cleanly onto Frame's detectors.
 - Detection through the LLM layer is non-deterministic, so a single run varies.
+
+## Go measurement (symbolic frontend)
+
+The Go frontend targets the taint-shaped and CWE-770 Go tasks (about 45 plus
+the CWE-770 slice of 44 resource tasks); the rest of the Go set stays LLM-only.
+Measure it in three runs over the same task ids:
+
+`run.py` launches `sys.executable -m frame.sil.cli` with the extracted snapshot
+as its working directory and discards stdout, so a wrong interpreter or a
+missing `PYTHONPATH` makes every scan fail silently and look like "no
+findings". Always run it with an interpreter that has tree-sitter, and point
+`PYTHONPATH` at the checkout being measured:
+
+```bash
+PY=/path/to/frame/.venv/bin/python
+IDS=$($PY benchmarks/vloc/go_subset.py --workspace "$WS" --extra 20)
+# 1. LLM-only baseline: a checkout of main from BEFORE the Go frontend
+(cd ../frame-main && PYTHONPATH=$PWD $PY benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/go-baseline" --only "$IDS")
+# 2. symbolic only, this branch (baseline: zero findings, TNR 1.0)
+PYTHONPATH=$PWD $PY benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/go-symbolic" --only "$IDS" --no-ai
+# 3. symbolic + LLM, this branch
+PYTHONPATH=$PWD $PY benchmarks/vloc/run.py --workspace "$WS" --out "$OUT/go-ai" --only "$IDS"
+$PY benchmarks/vloc/score.py --workspace "$WS" --results "$OUT/go-symbolic"
+```
+
+Every Phase B finding in run 2 is a false positive on patched code; triage
+each one. Because Go bypasses the LLM candidate gate, runs 1 and 3 call the
+LLM on the same files, so their difference isolates the symbolic layer and
+sink grounding.
