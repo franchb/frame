@@ -19,7 +19,7 @@ Usage:
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
+from typing import FrozenSet, Iterable, List, Dict, Optional, Any
 from pathlib import Path
 from enum import Enum
 import json
@@ -549,6 +549,47 @@ def skip_go_file(path: Path, root: Path) -> bool:
             continue
         break
     return _GO_GENERATED_HEADER.search("\n".join(leading_comments)) is not None
+
+
+# Directory names skipped by default during a directory scan, for every
+# language -- the exclusion happens on the file walk, before any frontend
+# sees a path. None of these hold project source:
+#   - .git                 VCS internals.
+#   - .claude, .cursor     Agent/tool workspace state. In particular
+#                          `.claude/worktrees/<branch>/` holds full copies of
+#                          the repository that Claude Code agents work in; a
+#                          directory scan that does not skip it multiplies
+#                          every finding once per worktree.
+#   - .worktrees           Same shape (a tool's own worktree copies), for
+#                          tools that keep it at the repo root instead.
+#   - .idea, .vscode       IDE project configuration, not source.
+#   - node_modules         Vendored JS dependencies -- someone else's code.
+#   - .venv, venv, .tox    Python virtualenvs. These can contain thousands of
+#                          third-party `.py` files, which is exactly the
+#                          "full copy that isn't project source" problem.
+#   - __pycache__          Python bytecode cache.
+#   - .mypy_cache,
+#     .pytest_cache        Tool caches, not source.
+#
+# Matching is on path components relative to the scan root (see
+# `scan_directory`), so a scan root that itself sits inside one of these
+# directories still scans normally -- only descendants named like this are
+# skipped.
+DEFAULT_EXCLUDED_SCAN_DIRS: FrozenSet[str] = frozenset({
+    ".git",
+    ".claude",
+    ".cursor",
+    ".worktrees",
+    ".idea",
+    ".vscode",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".tox",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+})
 
 
 class FrameScanner:
@@ -1218,24 +1259,58 @@ class FrameScanner:
 
         return self.scan(source_code, str(path))
 
-    def scan_directory(self, dirpath: str, pattern: str = "**/*.py", *,
-                       skip_tests: bool = False, exclude_dirs=()) -> List[ScanResult]:
+    @staticmethod
+    def _is_excluded_dir_member(filepath: Path, root: Path,
+                                 excluded_dirs: FrozenSet[str]) -> bool:
+        """Does `filepath` sit under one of `excluded_dirs`, relative to `root`?
+
+        Only directory components between `root` and the file are checked --
+        never the filename itself, and never anything above `root` -- so a
+        scan root that itself happens to be named (or nested in) an excluded
+        directory still has its own files scanned normally.
+        """
+        if not excluded_dirs:
+            return False
+        try:
+            rel_parts = filepath.relative_to(root).parts
+        except ValueError:
+            # Not actually under `root` (e.g. a differently-resolved symlink) --
+            # conservative default is to scan it, never to inspect components
+            # above `root` that this guarantee was never meant to cover.
+            return False
+        # Drop the filename: only directory components can match.
+        return any(part in excluded_dirs for part in rel_parts[:-1])
+
+    def scan_directory(self, dirpath: str, pattern: str = "**/*.py",
+                        exclude_dirs: Optional[Iterable[str]] = None, *,
+                        skip_tests: bool = False,
+                        exclude_patterns: Iterable[str] = ()) -> List[ScanResult]:
         """
         Scan all matching files in a directory.
 
         Args:
             dirpath: Directory path
             pattern: Glob pattern for files
+            exclude_dirs: Directory names to skip anywhere under `dirpath`
+                (matched against path components relative to `dirpath`, so a
+                scan root that itself sits inside such a directory is not
+                affected). Defaults to `DEFAULT_EXCLUDED_SCAN_DIRS` -- agent
+                and tool state directories like `.claude` and `.git` that are
+                never project source. Pass `[]` to disable filtering.
             skip_tests: Leave out test code by each language's convention
-                (see is_test_path). Off by default.
-            exclude_dirs: Globs for directories to leave out (see
-                is_excluded_dir), matched relative to dirpath.
+                (see is_test_path). Off by default. Applies in addition to
+                `exclude_dirs`.
+            exclude_patterns: `--exclude-dir` globs for directories to leave
+                out (see is_excluded_dir), matched relative to dirpath.
+                Applies in addition to `exclude_dirs`.
 
         Returns:
             List of ScanResult for each file
         """
         results = []
         dir_path = Path(dirpath)
+        excluded_dirs = (DEFAULT_EXCLUDED_SCAN_DIRS if exclude_dirs is None
+                          else frozenset(exclude_dirs))
 
         # The agentic detector can trace flows across files with its read_file and
         # grep tools, but only when it has a repo root; without one it silently
@@ -1255,36 +1330,46 @@ class FrameScanner:
 
         try:
             for filepath in dir_path.glob(pattern):
-                if filepath.is_file():
-                    if skip_tests or exclude_dirs:
-                        try:
-                            rel = filepath.relative_to(dir_path)
-                        except ValueError:
-                            rel = Path(filepath.name)
-                        if is_path_excluded(rel, skip_tests, exclude_dirs):
-                            continue
-                    if filepath.suffix.lower() == ".go" and skip_go_file(filepath, dir_path):
+                if not filepath.is_file():
+                    continue
+                if self._is_excluded_dir_member(filepath, dir_path, excluded_dirs):
+                    continue
+                if skip_tests or exclude_patterns:
+                    try:
+                        rel = filepath.relative_to(dir_path)
+                    except ValueError:
+                        rel = Path(filepath.name)
+                    if is_path_excluded(rel, skip_tests, exclude_patterns):
                         continue
-                    result = self.scan_file(str(filepath))
-                    results.append(result)
+                if filepath.suffix.lower() == ".go" and skip_go_file(filepath, dir_path):
+                    continue
+                result = self.scan_file(str(filepath))
+                results.append(result)
         finally:
             self.llm_detect = per_file_detect
 
         if repo_scale:
             results = self._apply_repo_scale_detect(
-                dir_path, results, skip_tests=skip_tests, exclude_dirs=exclude_dirs)
+                dir_path, results, excluded_dirs,
+                skip_tests=skip_tests, exclude_patterns=exclude_patterns)
 
         return results
 
-    def _apply_repo_scale_detect(self, dir_path: Path, results: List[ScanResult],
+    def _apply_repo_scale_detect(self, dir_path: Path,
+                                 results: List[ScanResult],
+                                 excluded_dirs: FrozenSet[str] = frozenset(), *,
                                  skip_tests: bool = False,
-                                 exclude_dirs=()) -> List[ScanResult]:
+                                 exclude_patterns: Iterable[str] = ()) -> List[ScanResult]:
         """Run one repository-wide LLM detection pass and merge its findings.
 
         Findings are attached to the ScanResult for the file they name, creating one
         if the file was not otherwise scanned (the model may legitimately flag a file
-        the glob did not match). Fail-safe: any error leaves the symbolic results
-        untouched, because a broken LLM tier must never discard proven findings.
+        the glob did not match). That legitimate case is exactly how an excluded
+        directory could sneak back in: the agent's own read_file/grep tools are not
+        limited to the glob's matches, so a newly-created result is still checked
+        against `excluded_dirs` before being kept. Fail-safe: any error leaves the
+        symbolic results untouched, because a broken LLM tier must never discard
+        proven findings.
         """
         try:
             from frame.sil.llm_detect import detect_repo
@@ -1297,14 +1382,15 @@ class FrameScanner:
                 if self.verbose:
                     print("[Scanner] repo-scale detect requested but no endpoint/model.")
                 return results
-            root = str(dir_path.resolve())
+            resolved_root = dir_path.resolve()
+            root = str(resolved_root)
             keep = None
-            if skip_tests or exclude_dirs:
+            if skip_tests or exclude_patterns:
                 # --skip-tests / --exclude-dir: excluded files never enter the
                 # model's inventory (nor use up its cap), and a finding it
                 # still reports in one is dropped below.
                 def keep(rel: str) -> bool:
-                    return not is_path_excluded(Path(rel), skip_tests, exclude_dirs)
+                    return not is_path_excluded(Path(rel), skip_tests, exclude_patterns)
                 found = detect_repo(root, self.language, config, self._llm_client,
                                     path_filter=keep)
             else:
@@ -1317,7 +1403,9 @@ class FrameScanner:
         by_file = {r.filename: r for r in results}
         for vuln in found or []:
             target = getattr(vuln, "location", "") or ""
-            if keep is not None and target:
+            if not target:
+                continue
+            if keep is not None:
                 try:
                     rel = Path(target).resolve().relative_to(root)
                 except (ValueError, OSError):
@@ -1326,6 +1414,8 @@ class FrameScanner:
                     continue
             result = by_file.get(target)
             if result is None:
+                if self._is_excluded_dir_member(Path(target), resolved_root, excluded_dirs):
+                    continue
                 result = ScanResult(filename=target)
                 by_file[target] = result
                 results.append(result)

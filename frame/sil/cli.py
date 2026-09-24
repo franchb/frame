@@ -68,6 +68,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="Skip directories matching this glob (repeatable; fnmatch, case sensitive). A bare name matches a directory of that name at any depth (e.g. 'vendor', '*_mock'). A pattern containing '/' -- including a trailing '/' or a leading './' -- is anchored at the scan root and excludes that directory's whole subtree; '*' also matches '/' (e.g. 'staging/', 'pkg/*/testing'). Ignored for single-file scans."
     )
     scan_parser.add_argument(
+        "--no-default-excludes",
+        action="store_true",
+        help="Directory scans skip agent/tool state directories by default "
+             "(.git, .claude, .cursor, .worktrees, .idea, .vscode, "
+             "node_modules, .venv/venv, .tox, __pycache__, .mypy_cache, "
+             ".pytest_cache). Pass this to scan them too."
+    )
+    scan_parser.add_argument(
         "-f", "--format",
         default="text",
         choices=["text", "json", "sarif"],
@@ -342,10 +350,11 @@ def cmd_scan(args) -> int:
             result = scanner.scan_file(str(target))
             results.append(result)
         else:
+            exclude_dirs = [] if getattr(args, "no_default_excludes", False) else None
             results = scanner.scan_directory(
-                str(target), args.pattern,
+                str(target), args.pattern, exclude_dirs=exclude_dirs,
                 skip_tests=getattr(args, "skip_tests", False),
-                exclude_dirs=getattr(args, "exclude_dir", None) or ())
+                exclude_patterns=getattr(args, "exclude_dir", None) or ())
     except LLMUnavailableError as e:
         print(f"Error: LLM layer unavailable -- scan aborted (findings NOT reliable): {e}",
               file=sys.stderr)

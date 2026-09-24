@@ -95,21 +95,21 @@ def test_scan_root_inside_a_test_directory_still_scans(tmp_path: Path):
 
 def test_exclude_dir_name_and_path_patterns(tmp_path: Path):
     _tree(tmp_path, GO_TREE, GO_VULN)
-    scanned = _scanned(tmp_path, "**/*.go", "go", exclude_dirs=["e2e", "pkg/*/testing"])
+    scanned = _scanned(tmp_path, "**/*.go", "go", exclude_patterns=["e2e", "pkg/*/testing"])
     assert "test/e2e/suite.go" not in scanned and "e2e/run.go" not in scanned
     assert "pkg/app/testing/fake.go" not in scanned
     assert {"main.go", "pkg/app/app.go", "tests/helper.go"} <= scanned
     # A path pattern is anchored at the scan root.
-    scanned = _scanned(tmp_path, "**/*.go", "go", exclude_dirs=["app/testing"])
+    scanned = _scanned(tmp_path, "**/*.go", "go", exclude_patterns=["app/testing"])
     assert "pkg/app/testing/fake.go" in scanned
-    scanned = _scanned(tmp_path, "**/*.go", "go", exclude_dirs=["pkg"])
+    scanned = _scanned(tmp_path, "**/*.go", "go", exclude_patterns=["pkg"])
     assert not any(s.startswith("pkg/") for s in scanned)
 
 
 def test_exclude_dir_matches_below_the_root_only(tmp_path: Path):
     root = tmp_path / "vendorish" / "src"
     _tree(root, ["main.go"], GO_VULN)
-    assert _scanned(root, "**/*.go", "go", exclude_dirs=["vendorish", "src"]) == {"main.go"}
+    assert _scanned(root, "**/*.go", "go", exclude_patterns=["vendorish", "src"]) == {"main.go"}
 
 
 def test_cli_skip_tests_and_repeated_exclude_dir(tmp_path: Path):
@@ -164,25 +164,25 @@ STAGING = ["staging/direct.go", "staging/src/k8s.io/api/a.go", "pkg/staging/b.go
 
 def test_exclude_dir_leading_dot_slash_is_anchored(tmp_path: Path):
     _tree(tmp_path, STAGING, GO_VULN)
-    assert _scanned(tmp_path, "**/*.go", "go", exclude_dirs=["./staging"]) == {
+    assert _scanned(tmp_path, "**/*.go", "go", exclude_patterns=["./staging"]) == {
         "pkg/staging/b.go", "main.go"}
 
 
 def test_exclude_dir_trailing_slash_is_anchored_and_covers_the_subtree(tmp_path: Path):
     _tree(tmp_path, STAGING, GO_VULN)
-    assert _scanned(tmp_path, "**/*.go", "go", exclude_dirs=["staging/"]) == {
+    assert _scanned(tmp_path, "**/*.go", "go", exclude_patterns=["staging/"]) == {
         "pkg/staging/b.go", "main.go"}
 
 
 def test_exclude_dir_bare_name_matches_any_depth(tmp_path: Path):
     _tree(tmp_path, STAGING, GO_VULN)
-    assert _scanned(tmp_path, "**/*.go", "go", exclude_dirs=["staging"]) == {"main.go"}
+    assert _scanned(tmp_path, "**/*.go", "go", exclude_patterns=["staging"]) == {"main.go"}
 
 
 def test_exclude_dir_star_matches_below_the_directory_only(tmp_path: Path):
     _tree(tmp_path, STAGING, GO_VULN)
     # `staging/*` names the directories inside staging/, not staging/ itself.
-    assert _scanned(tmp_path, "**/*.go", "go", exclude_dirs=["staging/*"]) == {
+    assert _scanned(tmp_path, "**/*.go", "go", exclude_patterns=["staging/*"]) == {
         "staging/direct.go", "pkg/staging/b.go", "main.go"}
 
 
@@ -213,7 +213,7 @@ def test_repo_scale_inventory_and_findings_respect_exclusions(tmp_path: Path, mo
 
     monkeypatch.setattr("frame.sil.llm_detect.detect_repo", fake_repo)
     results = _repo_scale_scanner(monkeypatch).scan_directory(
-        str(tmp_path), "**/*.go", skip_tests=True, exclude_dirs=["staging/"])
+        str(tmp_path), "**/*.go", skip_tests=True, exclude_patterns=["staging/"])
     assert seen["inventory"] == {"main.go"}
     flagged = {Path(r.filename).resolve().relative_to(tmp_path.resolve()).as_posix()
                for r in results if r.vulnerabilities}

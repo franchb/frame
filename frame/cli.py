@@ -77,6 +77,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="Skip directories matching this glob (repeatable; fnmatch, case sensitive). A bare name matches a directory of that name at any depth (e.g. 'vendor', '*_mock'). A pattern containing '/' -- including a trailing '/' or a leading './' -- is anchored at the scan root and excludes that directory's whole subtree; '*' also matches '/' (e.g. 'staging/', 'pkg/*/testing'). Ignored for single-file scans."
     )
     scan_parser.add_argument(
+        "--no-default-excludes",
+        action="store_true",
+        help="Directory scans skip agent/tool state directories by default "
+             "(.git, .claude, .cursor, .worktrees, .idea, .vscode, "
+             "node_modules, .venv/venv, .tox, __pycache__, .mypy_cache, "
+             ".pytest_cache). Pass this to scan them too."
+    )
+    scan_parser.add_argument(
         "-f", "--format",
         default="text",
         choices=["text", "json", "sarif"],
