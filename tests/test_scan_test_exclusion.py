@@ -240,3 +240,63 @@ def test_inventory_filter_is_applied_before_the_cap(tmp_path: Path):
     inv = _repo_inventory(str(tmp_path), "go", limit=2,
                           path_filter=lambda rel: not rel.startswith("test/"))
     assert inv.splitlines() == ["main.go"]
+
+
+# --- default excludes + --exclude-dir + --skip-tests together -----------------
+
+COMBINED = ["main.go", ".claude/worktrees/x/main.go", "tests/helper.go", "staging/s.go"]
+
+
+def _cli_scanned(main, root: Path, *extra):
+    out = root.parent / f"{root.name}-out.json"
+    # No `-l go`: frame.cli only offers `python`; files are dispatched by suffix.
+    rc = main(["scan", str(root), "-p", "**/*.go", "--no-verify",
+               "-f", "json", "-o", str(out), "--fail-on", "none", *extra])
+    assert rc == 0
+    data = json.loads(out.read_text())
+    out.unlink()
+    # A single result is emitted bare, several under "files".
+    files = {Path(f["filename"]).relative_to(root).as_posix()
+             for f in data.get("files", [data])}
+    return files
+
+
+def test_default_excludes_skip_tests_and_exclude_dir_combine_in_both_clis(tmp_path: Path):
+    from frame.cli import main as frame_main
+    root = tmp_path / "repo"
+    _tree(root, COMBINED, GO_VULN)
+    for main in (sil_main, frame_main):
+        # All three at once: the worktree copy (default), tests/ (--skip-tests)
+        # and staging/ (--exclude-dir) are all left out.
+        assert _cli_scanned(main, root, "--skip-tests", "--exclude-dir", "staging/") == {
+            "main.go"}
+        # --no-default-excludes turns off only the defaults: the worktree copy
+        # comes back, the user's --skip-tests / --exclude-dir still apply.
+        assert _cli_scanned(main, root, "--skip-tests", "--exclude-dir", "staging/",
+                            "--no-default-excludes") == {
+            "main.go", ".claude/worktrees/x/main.go"}
+
+
+def test_repo_scale_honours_default_excludes_skip_tests_and_exclude_dir(
+        tmp_path: Path, monkeypatch, capsys):
+    from frame.sil import llm_detect
+    _tree(tmp_path, COMBINED, "package main\n")
+    seen = {}
+
+    def fake_repo(root, language, config, client=None, max_steps=None, path_filter=None):
+        seen["inventory"] = set(llm_detect._repo_inventory(
+            root, language, path_filter=path_filter).splitlines())
+        return [v for rel in COMBINED for v in _llm_finding(tmp_path, rel)]
+
+    monkeypatch.setattr("frame.sil.llm_detect.detect_repo", fake_repo)
+    scanner = _repo_scale_scanner(monkeypatch)
+    scanner.verbose = True
+    results = scanner.scan_directory(
+        str(tmp_path), "**/*.go", skip_tests=True, exclude_patterns=["staging/"])
+    assert seen["inventory"] == {"main.go"}
+    flagged = {Path(r.filename).resolve().relative_to(tmp_path.resolve()).as_posix()
+               for r in results if r.vulnerabilities}
+    assert flagged == {"main.go"}
+    out = capsys.readouterr().out
+    assert "under an excluded directory" in out and ".claude/worktrees/x/main.go" in out
+    assert "excluded by --skip-tests/--exclude-dir" in out and "staging/s.go" in out

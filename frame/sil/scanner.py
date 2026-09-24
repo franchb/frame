@@ -1468,6 +1468,9 @@ class FrameScanner:
                 except (ValueError, OSError):
                     rel = None
                 if rel is not None and not keep(rel.as_posix()):
+                    if self.verbose:
+                        print(f"[Scanner] repo-scale finding dropped, "
+                              f"path is excluded by --skip-tests/--exclude-dir: {target}")
                     continue
             result = by_file.get(target)
             if result is None:

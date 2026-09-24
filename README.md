@@ -73,7 +73,10 @@ frame scan src/ --format sarif -o results.sarif --fail-on high
 
 `--skip-tests` follows each language's convention; for Go it also treats every
 directory named `testing/` as test code (e.g. client-go's `testing` fakes). The
-full per-language list is in `frame scan --help`.
+full per-language list is in `frame scan --help`. Both options apply on top of the
+default directory excludes (agent worktrees, `.git`, dependency and cache
+directories -- see the command table below); `--no-default-excludes` turns off
+only those defaults, never `--skip-tests` or `--exclude-dir`.
 
 <details>
 <summary><strong>More examples</strong></summary>
@@ -99,7 +102,7 @@ Frame is one CLI covering the whole workflow (detect, triage, exploit, fix) plus
 
 | Command | What it does |
 |---------|--------------|
-| `frame scan <path>` | Scan source for vulnerabilities (sound symbolic engine; add `--ai` for LLM detection + triage). `-f json\|sarif`, `-o <file>`, `--fail-on <sev>`. Directory scans skip agent/tool and dependency directories by default (`.git`, `.claude/worktrees`, `.cursor/worktrees`, `.worktrees`, `.idea`, `.vscode`, `node_modules`, `.venv`, `venv` only if it looks like a virtualenv, `.tox`, `__pycache__`, `.mypy_cache`, `.pytest_cache`); `--no-default-excludes` to scan them anyway. |
+| `frame scan <path>` | Scan source for vulnerabilities (sound symbolic engine; add `--ai` for LLM detection + triage). `-f json\|sarif`, `-o <file>`, `--fail-on <sev>`. Directory scans skip agent/tool and dependency directories by default (`.git`, `.claude/worktrees`, `.cursor/worktrees`, `.worktrees`, `.idea`, `.vscode`, `node_modules`, `.venv`, `venv` only if it looks like a virtualenv, `.tox`, `__pycache__`, `.mypy_cache`, `.pytest_cache`); `--no-default-excludes` to scan them anyway. `--skip-tests` and `--exclude-dir PATTERN` exclude more on top (see above). |
 | `frame exploit --target <url>` | Drive an LLM agent to exploit a live, authorized target. Prime it with `--guidance <findings.json\|->` from a scan so it attacks the localized flaw. `--goal`, `--success-check`, `--max-steps`. |
 | `frame fix <path>` | Generate a fix for each scan finding, then re-scan the patched code to confirm the vulnerability is gone. `--guidance <findings.json\|->`, `--in-place` or `--diff`. |
 | `frame solve "<P> \|- <Q>"` | Check a single separation-logic entailment. |
