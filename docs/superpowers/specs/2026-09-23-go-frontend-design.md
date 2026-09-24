@@ -455,8 +455,11 @@ it, rather than one value read from it. Such an argument is any of:
   `r.Header`, `r.Body`, a gin / echo `c`;
 - a value of a bulk request-data type (`REQUEST_DATA_TYPES`), whether passed
   inline or through a variable: `r.URL`, `r.URL.Query()`,
-  `q := r.URL.Query()`, a cookie from `r.Cookie`;
-- the result of `r.Cookies()`;
+  `q := r.URL.Query()`, a cookie from `r.Cookie`, and the cookies from
+  `r.Cookies()`, including `ck := r.Cookies()` and the element variable of
+  `for _, c := range r.Cookies()`. The range variable is typed only for
+  these request-data slices;
+- the result of `r.Cookies()` passed inline;
 - a composite literal that carries any of these: `Params{Req: r}`.
 
 Such a call is an accessor in disguise: a cookie or session reader, a binder,

@@ -912,8 +912,12 @@ class GoFrontend:
         if range_value is not None:
             left = clause.child_by_field_name("left")
             declare = any(c.type == ":=" for c in clause.children)
-            for lnode in (left.named_children if left is not None else []):
-                self._assign_target(lnode, range_value, declare, UNKNOWN, None)
+            # Element typing only for bulk request data (`range r.Cookies()`).
+            over = self._type_of(clause.child_by_field_name("right")).path
+            elem = GoType(over[2:], True) if (over.startswith("[]")
+                                              and over in REQUEST_DATA_TYPES) else UNKNOWN
+            for i, lnode in enumerate(left.named_children if left is not None else []):
+                self._assign_target(lnode, range_value, declare, elem if i == 1 else UNKNOWN, None)
         self._lower_block(body)
         self._breakables.pop()
         if self._node is not None:

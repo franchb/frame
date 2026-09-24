@@ -196,6 +196,8 @@ RESULT_TYPES: Dict[str, str] = {
     "net/http.Request.Cookie": "net/http.Cookie",
     "net/http.Request.Clone": "net/http.Request",
     "net/http.Request.WithContext": "net/http.Request",
+    # A lookup key only ("[]" + element): _is_request_data and range typing.
+    "net/http.Request.Cookies": "[]net/http.Cookie",
 }
 for _m in ("Where", "Order", "Group", "Model", "Table", "Raw", "Joins", "Select",
            "Session", "WithContext", "Debug", "Limit", "Offset", "Preload"):
@@ -221,7 +223,7 @@ SERVER_CONTEXT_TYPES: FrozenSet[str] = frozenset({
 # makes its result request data (go_frontend._is_request_data).
 REQUEST_DATA_TYPES: FrozenSet[str] = frozenset({
     REQUEST_TYPE, *SERVER_CONTEXT_TYPES, "net/url.URL", "net/url.Values",
-    "net/http.Header", "net/http.Cookie"})
+    "net/http.Header", "net/http.Cookie", "[]net/http.Cookie"})
 REQUEST_DATA_CALLS: FrozenSet[str] = frozenset({"net/http.Request.Cookies"})
 LIBRARY_PARAM_TYPES: FrozenSet[str] = frozenset({"string", "[]byte", "io.Reader"})
 HANDLER_REGISTRAR_FUNCS: FrozenSet[str] = frozenset({

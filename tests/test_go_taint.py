@@ -1467,3 +1467,16 @@ func Outer(p Svc) http.Handler {
     raw = src.encode()
     marked = {raw[s:e].decode() for s, e in fe._unresolved_method_calls}
     assert marked == {'p.Next(r.FormValue("a"))'}, marked
+
+
+def test_destination_from_call_taking_cookies_through_variable_or_range_fires():
+    extra = ("type Flow interface{ Next(interface{}) State; Begin(interface{}, string) State }\n"
+             "type State struct{ ReturnTo string }\nvar svc Flow")
+    for body in ('ck := r.Cookies()\nst := svc.Next(ck)\nhttp.Redirect(w, r, st.ReturnTo, 302)',
+                 'for _, c := range r.Cookies() {\nst := svc.Next(c)\n'
+                 'http.Redirect(w, r, st.ReturnTo, 302)\n}'):
+        assert "CWE-601" in _cwes(_handler(body, RD, extra)), body
+    # Still silent: a scalar selector next to the request context.
+    src = _handler('st := svc.Begin(r.Context(), r.URL.Query().Get("idp"))\n'
+                   'http.Redirect(w, r, st.ReturnTo, 302)', RD, extra)
+    _pair("CWE-601", src.replace("st.ReturnTo", 'r.FormValue("next")'), src)
