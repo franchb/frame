@@ -65,7 +65,7 @@ def create_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="PATTERN",
-        help="Skip directories matching this glob (repeatable). A pattern without '/' matches any directory name (e.g. 'vendor', '*_mock'); a pattern with '/' matches a directory path relative to the scan root, where '*' also matches '/' (e.g. 'staging/*', 'pkg/*/testing'). Ignored for single-file scans."
+        help="Skip directories matching this glob (repeatable; fnmatch, case sensitive). A bare name matches a directory of that name at any depth (e.g. 'vendor', '*_mock'). A pattern containing '/' -- including a trailing '/' or a leading './' -- is anchored at the scan root and excludes that directory's whole subtree; '*' also matches '/' (e.g. 'staging/', 'pkg/*/testing'). Ignored for single-file scans."
     )
     scan_parser.add_argument(
         "-f", "--format",

@@ -366,12 +366,14 @@ DETECT_REPO_SYSTEM = (
 )
 
 
-def _repo_inventory(repo_root: str, language: str, limit: int = 400) -> str:
+def _repo_inventory(repo_root: str, language: str, limit: int = 400,
+                    path_filter=None) -> str:
     """A bounded listing of the repository's source files, as a starting map.
 
     The agent could discover this itself, but spending tool calls to re-list a tree
     we can hand over for free wastes its step budget on navigation instead of
-    analysis.
+    analysis. `path_filter(rel_posix_path) -> bool`, when given, keeps only the
+    files it accepts (the scan's --skip-tests / --exclude-dir), before the cap.
     """
     import os
     exts = _LANGUAGE_EXTENSIONS.get((language or "").lower())
@@ -385,6 +387,8 @@ def _repo_inventory(repo_root: str, language: str, limit: int = 400) -> str:
             if exts and not name.lower().endswith(exts):
                 continue
             rel = os.path.relpath(os.path.join(dirpath, name), root)
+            if path_filter is not None and not path_filter(rel.replace(os.sep, "/")):
+                continue
             found.append(rel)
             if len(found) >= limit:
                 found.append(f"... (listing truncated at {limit} files)")
@@ -435,7 +439,8 @@ def _repo_findings_to_vulns(findings: list, repo_root: str) -> List[Any]:
 
 def detect_repo(repo_root: str, language: str, config: TriageConfig,
                 client: Optional[LLMTriageClient] = None,
-                max_steps: Optional[int] = None) -> List[Any]:
+                max_steps: Optional[int] = None,
+                path_filter=None) -> List[Any]:
     """Detect vulnerabilities across a whole repository in a single agentic session.
 
     Returns the findings, each already resolved to an absolute path inside
@@ -450,7 +455,7 @@ def detect_repo(repo_root: str, language: str, config: TriageConfig,
     explored: set = set()
     client._explored = explored
     root = os.path.realpath(repo_root)
-    inventory = _repo_inventory(root, language)
+    inventory = _repo_inventory(root, language, path_filter=path_filter)
     if not inventory.strip():
         return []
     steps = max_steps if max_steps is not None else max(

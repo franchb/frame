@@ -60,8 +60,9 @@ frame scan app.py
 frame scan src/ --pattern "**/*.py"
 
 # Leave out test code (per-language conventions, off by default) and directories
-# matching a glob (name, or a path relative to the scan root; repeatable)
-frame scan ./repo -p "**/*.go" --skip-tests --exclude-dir "staging/*"
+# matching a glob (a bare name matches at any depth; a pattern with `/` is anchored
+# at the scan root and drops that subtree; repeatable)
+frame scan ./repo -p "**/*.go" --skip-tests --exclude-dir "staging/"
 
 # AI-assisted scan: LLM detection + triage (needs an LLM endpoint, see below)
 frame scan src/ --ai
@@ -69,6 +70,10 @@ frame scan src/ --ai
 # CI/CD integration (SARIF output)
 frame scan src/ --format sarif -o results.sarif --fail-on high
 ```
+
+`--skip-tests` follows each language's convention; for Go it also treats every
+directory named `testing/` as test code (e.g. client-go's `testing` fakes). The
+full per-language list is in `frame scan --help`.
 
 <details>
 <summary><strong>More examples</strong></summary>

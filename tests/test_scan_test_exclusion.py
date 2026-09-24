@@ -155,3 +155,88 @@ def test_other_language_conventions():
     assert not is_test_path(Path("src/App/Foo.cs"))
     assert is_test_path(Path("lib/tests/check.c"))
     assert not is_excluded_dir(Path("main.go"), ["*"])
+
+
+# --- --exclude-dir normalization -------------------------------------------
+
+STAGING = ["staging/direct.go", "staging/src/k8s.io/api/a.go", "pkg/staging/b.go", "main.go"]
+
+
+def test_exclude_dir_leading_dot_slash_is_anchored(tmp_path: Path):
+    _tree(tmp_path, STAGING, GO_VULN)
+    assert _scanned(tmp_path, "**/*.go", "go", exclude_dirs=["./staging"]) == {
+        "pkg/staging/b.go", "main.go"}
+
+
+def test_exclude_dir_trailing_slash_is_anchored_and_covers_the_subtree(tmp_path: Path):
+    _tree(tmp_path, STAGING, GO_VULN)
+    assert _scanned(tmp_path, "**/*.go", "go", exclude_dirs=["staging/"]) == {
+        "pkg/staging/b.go", "main.go"}
+
+
+def test_exclude_dir_bare_name_matches_any_depth(tmp_path: Path):
+    _tree(tmp_path, STAGING, GO_VULN)
+    assert _scanned(tmp_path, "**/*.go", "go", exclude_dirs=["staging"]) == {"main.go"}
+
+
+def test_exclude_dir_star_matches_below_the_directory_only(tmp_path: Path):
+    _tree(tmp_path, STAGING, GO_VULN)
+    # `staging/*` names the directories inside staging/, not staging/ itself.
+    assert _scanned(tmp_path, "**/*.go", "go", exclude_dirs=["staging/*"]) == {
+        "staging/direct.go", "pkg/staging/b.go", "main.go"}
+
+
+# --- --ai --repo-scale honours the exclusions --------------------------------
+
+def _repo_scale_scanner(monkeypatch):
+    monkeypatch.setenv("FRAME_LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("FRAME_LLM_MODEL", "m")
+    return FrameScanner(language="go", verify=False, llm_detect=True, llm_repo_scale=True)
+
+
+def _llm_finding(root: Path, rel: str):
+    from frame.sil.llm_detect import _repo_findings_to_vulns
+    return _repo_findings_to_vulns([{"file": rel, "cwe": "CWE-22", "line": 1, "type": "path",
+                                     "confidence": 0.9, "reasoning": "r"}], str(root))
+
+
+def test_repo_scale_inventory_and_findings_respect_exclusions(tmp_path: Path, monkeypatch):
+    from frame.sil import llm_detect
+    _tree(tmp_path, ["main.go", "test/e2e/suite.go", "staging/x/s.go"], "package main\n")
+    seen = {}
+
+    def fake_repo(root, language, config, client=None, max_steps=None, path_filter=None):
+        seen["inventory"] = set(llm_detect._repo_inventory(
+            root, language, path_filter=path_filter).splitlines())
+        return [v for rel in ("main.go", "test/e2e/suite.go", "staging/x/s.go")
+                for v in _llm_finding(tmp_path, rel)]
+
+    monkeypatch.setattr("frame.sil.llm_detect.detect_repo", fake_repo)
+    results = _repo_scale_scanner(monkeypatch).scan_directory(
+        str(tmp_path), "**/*.go", skip_tests=True, exclude_dirs=["staging/"])
+    assert seen["inventory"] == {"main.go"}
+    flagged = {Path(r.filename).resolve().relative_to(tmp_path.resolve()).as_posix()
+               for r in results if r.vulnerabilities}
+    assert flagged == {"main.go"}
+
+
+def test_repo_scale_default_is_unchanged(tmp_path: Path, monkeypatch):
+    _tree(tmp_path, ["main.go", "test/e2e/suite.go"], "package main\n")
+    calls = []
+
+    def fake_repo(root, language, config, client=None, max_steps=None):   # old signature
+        calls.append(root)
+        return [v for rel in ("main.go", "test/e2e/suite.go") for v in _llm_finding(tmp_path, rel)]
+
+    monkeypatch.setattr("frame.sil.llm_detect.detect_repo", fake_repo)
+    results = _repo_scale_scanner(monkeypatch).scan_directory(str(tmp_path), "**/*.go")
+    assert len(calls) == 1
+    assert sum(1 for r in results if r.vulnerabilities) == 2
+
+
+def test_inventory_filter_is_applied_before_the_cap(tmp_path: Path):
+    from frame.sil.llm_detect import _repo_inventory
+    _tree(tmp_path, [f"test/t{i}.go" for i in range(5)] + ["main.go"], "package main\n")
+    inv = _repo_inventory(str(tmp_path), "go", limit=2,
+                          path_filter=lambda rel: not rel.startswith("test/"))
+    assert inv.splitlines() == ["main.go"]

@@ -452,22 +452,41 @@ def is_test_path(rel: Path) -> bool:
 
 def is_excluded_dir(rel: Path, patterns) -> bool:
     """Does a directory on the way from the scan root to `rel` match one of the
-    `--exclude-dir` globs? A pattern without `/` is matched (fnmatch, case
-    sensitive) against each directory name; a pattern with `/` against each
-    directory's path relative to the scan root, in `/` form, where `*` also
-    matches `/` (`pkg/*/testing`, `staging/*`)."""
+    `--exclude-dir` globs (fnmatch, case sensitive)?
+
+    * A bare name (no `/`), e.g. `vendor` or `*_mock`, matches a directory of
+      that name at any depth.
+    * A pattern containing `/` -- including a trailing one (`staging/`) or a
+      leading `./` (`./staging`) -- is anchored at the scan root and matched
+      against each directory's root-relative path, so it excludes that
+      directory's whole subtree. `*` also matches `/` (`pkg/*/testing`).
+    """
     import fnmatch
     dirs = rel.parts[:-1]
-    for pat in patterns or ():
-        pat = pat.strip().strip("/")
-        if not pat:
+    paths = ["/".join(dirs[:i + 1]) for i in range(len(dirs))]
+    for raw in patterns or ():
+        pat = raw.strip().replace("\\", "/")
+        anchored = "/" in pat
+        while pat.startswith("./"):
+            pat = pat[2:]
+        pat = pat.strip("/")
+        if not pat or pat == ".":
             continue
-        if "/" in pat:
-            if any(fnmatch.fnmatchcase("/".join(dirs[:i + 1]), pat) for i in range(len(dirs))):
+        if anchored:
+            if any(fnmatch.fnmatchcase(p, pat) for p in paths):
                 return True
         elif any(fnmatch.fnmatchcase(d, pat) for d in dirs):
             return True
     return False
+
+
+def is_path_excluded(rel: Path, skip_tests: bool = False, exclude_dirs=()) -> bool:
+    """The directory-scan filter for `--skip-tests` / `--exclude-dir`, on a path
+    relative to the scan root."""
+    return bool((exclude_dirs and is_excluded_dir(rel, exclude_dirs))
+                or (skip_tests and is_test_path(rel)))
+
+
 _GO_GENERATED_HEADER = re.compile(r"^// Code generated .* DO NOT EDIT\.\s*$", re.MULTILINE)
 
 
@@ -1240,9 +1259,7 @@ class FrameScanner:
                             rel = filepath.relative_to(dir_path)
                         except ValueError:
                             rel = Path(filepath.name)
-                        if exclude_dirs and is_excluded_dir(rel, exclude_dirs):
-                            continue
-                        if skip_tests and is_test_path(rel):
+                        if is_path_excluded(rel, skip_tests, exclude_dirs):
                             continue
                     if filepath.suffix.lower() == ".go" and skip_go_file(filepath, dir_path):
                         continue
@@ -1252,12 +1269,14 @@ class FrameScanner:
             self.llm_detect = per_file_detect
 
         if repo_scale:
-            results = self._apply_repo_scale_detect(dir_path, results)
+            results = self._apply_repo_scale_detect(
+                dir_path, results, skip_tests=skip_tests, exclude_dirs=exclude_dirs)
 
         return results
 
-    def _apply_repo_scale_detect(self, dir_path: Path,
-                                 results: List[ScanResult]) -> List[ScanResult]:
+    def _apply_repo_scale_detect(self, dir_path: Path, results: List[ScanResult],
+                                 skip_tests: bool = False,
+                                 exclude_dirs=()) -> List[ScanResult]:
         """Run one repository-wide LLM detection pass and merge its findings.
 
         Findings are attached to the ScanResult for the file they name, creating one
@@ -1277,7 +1296,17 @@ class FrameScanner:
                     print("[Scanner] repo-scale detect requested but no endpoint/model.")
                 return results
             root = str(dir_path.resolve())
-            found = detect_repo(root, self.language, config, self._llm_client)
+            keep = None
+            if skip_tests or exclude_dirs:
+                # --skip-tests / --exclude-dir: excluded files never enter the
+                # model's inventory (nor use up its cap), and a finding it
+                # still reports in one is dropped below.
+                def keep(rel: str) -> bool:
+                    return not is_path_excluded(Path(rel), skip_tests, exclude_dirs)
+                found = detect_repo(root, self.language, config, self._llm_client,
+                                    path_filter=keep)
+            else:
+                found = detect_repo(root, self.language, config, self._llm_client)
         except Exception as e:
             if self.verbose:
                 print(f"[Scanner] repo-scale detect failed: {e}")
@@ -1286,6 +1315,13 @@ class FrameScanner:
         by_file = {r.filename: r for r in results}
         for vuln in found or []:
             target = getattr(vuln, "location", "") or ""
+            if keep is not None and target:
+                try:
+                    rel = Path(target).resolve().relative_to(root)
+                except (ValueError, OSError):
+                    rel = None
+                if rel is not None and not keep(rel.as_posix()):
+                    continue
             result = by_file.get(target)
             if result is None:
                 result = ScanResult(filename=target)
