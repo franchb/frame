@@ -212,6 +212,32 @@ def test_unrelated_identifier_value_fires_other_languages(lang, ext, code):
     assert _secrets(lang, ext, code), f"missed secret in {code!r} ({lang})"
 
 
+# `action` / `permission` are descriptors only as the LEADING name token (the
+# Go `ActionX` / `PermissionX` idiom). Anywhere else -- or plural, as in a CI
+# `ACTIONS_*` secret -- they name where a real credential is used.
+_ACTION_NAMED_SECRETS = [
+    ("ACTIONS_SECRET", "hunter2_pass"),
+    ("ACTIONS_SECRET", "prod-deploy-secret"),
+    ("GH_ACTIONS_SECRET", "super-secret-value"),
+    ("GITHUB_ACTIONS_TOKEN", "prod-deploy-token"),
+    ("GITHUB_ACTIONS_TOKEN", "hunter2_pass"),
+    ("GITHUB_ACTIONS_TOKEN", "PROD_DEPLOY_TOKEN_2024"),
+    ("actions_token", "my-actions-token"),
+    ("DEPLOY_ACTION_TOKEN", "prod-release-token"),
+    ("PERMISSIONS_TOKEN", "ci-bot-token"),
+]
+_ACTION_CASES = [(lang, ext, tpl, name, value)
+                 for (lang, ext, tpl) in (_TEMPLATES[0], _TEMPLATES[3])
+                 for (name, value) in _ACTION_NAMED_SECRETS]
+
+
+@pytest.mark.parametrize("lang,ext,tpl,name,value", _ACTION_CASES, ids=_ids(_ACTION_CASES))
+def test_non_leading_action_permission_is_not_descriptor(lang, ext, tpl, name, value):
+    code = tpl.format(name=name, value=value)
+    assert _secrets(lang, ext, code), f"missed secret in {name} = {value!r} ({lang})"
+    assert not FrameScanner._is_nonsecret_value(name, value)
+
+
 # --- unit tests of the classifier itself -----------------------------------
 
 @pytest.mark.parametrize("target,value", [
