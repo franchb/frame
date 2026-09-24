@@ -405,6 +405,27 @@ Bracketed numbers are the sink argument index.
 | 79 | `HTML_OUTPUT` | `template.HTML(x)` conversion [0] only |
 | 770 | `ALLOC_SIZE` | `make([]T, n)` [len and cap]; `strings.Repeat`, `bytes.Repeat` [1] |
 
+**Program name from an unresolved call (CWE-78).** At the program-name
+argument of `exec.Command` [0] / `exec.CommandContext` [1] (not the retargeted
+`sh -c` script), the site's sink is dropped when the argument's value is, on
+every path reaching the call, exactly the result of an *unresolved
+bare-identifier call*: `f(...)` where `f` is not a local, not a function, type,
+package variable or constant declared in this file, and not a builtin or
+builtin type -- in practice a same-package function in another file (e.g. a
+`_linux.go` / `_windows.go` variant, as in Kubernetes'
+`cmdStr, args, env, err := getLoggingCmd(n, services)`). Default unknown-call
+propagation still taints those results for every other sink and for further
+propagation; it is just not evidence enough that the executable is
+attacker-chosen. Definitions are tracked flow-sensitively beside the guard
+facts (any other assignment clears one, joins intersect, loop heads and labels
+clear, deferred emission is excluded). Unresolved method calls, package-qualified
+calls and the `sh -c` retarget are unaffected. Stated recall loss:
+`exec.Command(lookup(r.FormValue("c")))` with `lookup` defined in another file
+of the package is silent, and so is a cross-file type conversion,
+`exec.Command(Bin(r.FormValue("c")))` with `type Bin string` declared in another
+file (a per-file frontend cannot tell a conversion from a call). Phase B's
+package-scope summaries remove both.
+
 Deliberate exclusions: parameter arguments of parameterized queries;
 `exec.Command("git", tainted...)` (CWE-88, out of scope); `os.Root` and its
 methods (traversal-resistant); writes to `http.ResponseWriter` (XSS precision

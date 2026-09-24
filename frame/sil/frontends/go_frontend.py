@@ -57,8 +57,11 @@ _STRING_LITERALS = ("interpreted_string_literal", "raw_string_literal")
 # (`__str__`, free variables) at the default recursion limit, so a 2,000-entry
 # composite literal or `+` chain lowered left-deep crashed the whole file.
 # Short chains keep the left-deep shape, so ordinary code lowers unchanged.
+# Only associative operators are rebalanced (`+`, `*`, `&&`, `||` and the
+# bitwise `|`, `&`, `^` of long flag masks); `-`, `/`, shifts and comparisons
+# keep their tree.
 _BALANCE_ABOVE = 64
-_ASSOCIATIVE_OPS = frozenset({"+", "&&", "||"})
+_ASSOCIATIVE_OPS = frozenset({"+", "*", "&&", "||", "|", "&", "^"})
 
 
 def _fold(op: str, exps: List[Exp]) -> Exp:

@@ -1228,3 +1228,26 @@ def test_program_name_reassigned_on_one_branch_fires():
     assert "CWE-78" in _cwes(_handler(
         'c := r.FormValue("c")\nif r.Method == "POST" { c, _ = getCmd(c) }\n'
         'exec.Command(c).Run()', EX))
+
+
+def test_long_bitwise_and_product_chains_scan():
+    for op in ("|", "&", "^", "*"):
+        chain = f" {op} ".join(["n"] * 1500)
+        body = (f'n := len(r.FormValue("a"))\nm := {chain}\n_ = m\n'
+                'exec.Command(r.FormValue("c"))')
+        assert "CWE-78" in _cwes(_handler(body, EX)), op
+
+
+def test_non_associative_chains_keep_their_shape():
+    from frame.sil.frontends.go_frontend import GoFrontend
+    from frame.sil.instructions import Assign
+    from frame.sil.types import ExpBinOp
+    chain = " - ".join(["n"] * 80)
+    prog = GoFrontend().translate(
+        f"package main\nfunc f(n int) int {{ m := {chain}\nreturn m }}\n", "t.go")
+    exp = next(i.exp for nd in prog.procedures["go:f"].nodes.values() for i in nd.instrs
+               if isinstance(i, Assign) and str(i.id) == "m")
+    depth = 0
+    while isinstance(exp, ExpBinOp):
+        exp, depth = exp.left, depth + 1
+    assert depth == 79          # left-deep: `-` is not reassociated
