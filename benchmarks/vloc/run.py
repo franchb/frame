@@ -51,7 +51,8 @@ def extract(zip_path: Path, dest: Path) -> bool:
 
 
 def frame_scan(repo: Path, language: str, patterns: list, use_ai: bool,
-               timeout: int, repo_scale: bool = False) -> tuple:
+               timeout: int, repo_scale: bool = False, skip_tests: bool = False,
+               exclude_dirs: tuple = ()) -> tuple:
     """Run `frame scan` once per glob. Returns (findings, errors)."""
     findings, errors = [], []
     for pat in patterns:
@@ -65,6 +66,10 @@ def frame_scan(repo: Path, language: str, patterns: list, use_ai: bool,
             # Per-file costs ~40 sessions on a typical project here, which is the
             # difference between minutes and days across 500 tasks.
             cmd.append("--repo-scale")
+        if skip_tests:
+            cmd.append("--skip-tests")
+        for d in exclude_dirs:
+            cmd += ["--exclude-dir", d]
         try:
             r = subprocess.run(cmd, cwd=repo, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE, text=True, timeout=timeout)
@@ -140,6 +145,10 @@ def main() -> int:
     ap.add_argument("--repo-scale", action="store_true",
                     help="one LLM session per repository instead of one per file")
     ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--skip-tests", action="store_true",
+                    help="pass --skip-tests to frame scan (leave out test code)")
+    ap.add_argument("--exclude-dir", action="append", default=[], metavar="PATTERN",
+                    help="pass --exclude-dir PATTERN to frame scan (repeatable)")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -187,7 +196,9 @@ def main() -> int:
             try:
                 findings, errors = frame_scan(repo, language, patterns,
                                               use_ai=not args.no_ai, timeout=args.timeout,
-                                              repo_scale=args.repo_scale)
+                                              repo_scale=args.repo_scale,
+                                              skip_tests=args.skip_tests,
+                                              exclude_dirs=tuple(args.exclude_dir))
                 files = to_prediction(findings, repo, target, args.cwe_any, args.top_k)
             finally:
                 shutil.rmtree(repo, ignore_errors=True)   # keep peak disk small

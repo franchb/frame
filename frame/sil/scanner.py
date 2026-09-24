@@ -403,6 +403,71 @@ def is_generated_source(source_code: str,
 
 
 _GO_SKIP_DIRS = frozenset({"vendor", "testdata", "third_party"})
+
+# --- Opt-in test-code exclusion (`scan --skip-tests`) -----------------------
+# Chosen per file by its suffix, by each ecosystem's own convention. Directory
+# names are matched exactly against the directories between the scan root and
+# the file (never the root itself or anything above it), so a scan rooted
+# inside a `test/` tree still analyses it.
+_TEST_DIRS_BY_SUFFIX = {
+    # Go: `*_test.go` is always skipped by skip_go_file; these are the
+    # conventional homes of e2e suites, fixtures and test helpers.
+    ".go": frozenset({"test", "tests", "e2e", "testdata", "testing"}),
+    ".py": frozenset({"test", "tests"}),
+    ".c": frozenset({"test", "tests"}), ".h": frozenset({"test", "tests"}),
+    ".cpp": frozenset({"test", "tests"}), ".cc": frozenset({"test", "tests"}),
+    ".cxx": frozenset({"test", "tests"}), ".hpp": frozenset({"test", "tests"}),
+}
+_JS_SUFFIXES = frozenset({".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"})
+
+
+def is_test_path(rel: Path) -> bool:
+    """Is the file at `rel` (relative to the scan root) test code by its
+    language's convention?
+
+    Go: directories `test`, `tests`, `e2e`, `testdata`, `testing`.
+    Python: `test_*.py`, `*_test.py`, `conftest.py`, directories `test`, `tests`.
+    JavaScript / TypeScript: `*.test.*`, `*.spec.*`, directory `__tests__`.
+    Java: anything under a `src/test/` pair of directories (Maven / Gradle).
+    C#: a directory whose name contains `Tests` (e.g. `App.Tests`, `UnitTests`).
+    C / C++: directories `test`, `tests`.
+    """
+    dirs, name = rel.parts[:-1], rel.name
+    suffix = rel.suffix.lower()
+    if any(d in _TEST_DIRS_BY_SUFFIX.get(suffix, ()) for d in dirs):
+        return True
+    if suffix == ".go":
+        return name.endswith("_test.go")
+    if suffix == ".py":
+        return name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py"
+    if suffix in _JS_SUFFIXES:
+        stem_parts = name.split(".")[1:-1]
+        return "__tests__" in dirs or "test" in stem_parts or "spec" in stem_parts
+    if suffix == ".java":
+        return any(a == "src" and b == "test" for a, b in zip(dirs, dirs[1:]))
+    if suffix == ".cs":
+        return any("Tests" in d for d in dirs)
+    return False
+
+
+def is_excluded_dir(rel: Path, patterns) -> bool:
+    """Does a directory on the way from the scan root to `rel` match one of the
+    `--exclude-dir` globs? A pattern without `/` is matched (fnmatch, case
+    sensitive) against each directory name; a pattern with `/` against each
+    directory's path relative to the scan root, in `/` form, where `*` also
+    matches `/` (`pkg/*/testing`, `staging/*`)."""
+    import fnmatch
+    dirs = rel.parts[:-1]
+    for pat in patterns or ():
+        pat = pat.strip().strip("/")
+        if not pat:
+            continue
+        if "/" in pat:
+            if any(fnmatch.fnmatchcase("/".join(dirs[:i + 1]), pat) for i in range(len(dirs))):
+                return True
+        elif any(fnmatch.fnmatchcase(d, pat) for d in dirs):
+            return True
+    return False
 _GO_GENERATED_HEADER = re.compile(r"^// Code generated .* DO NOT EDIT\.\s*$", re.MULTILINE)
 
 
@@ -1132,13 +1197,18 @@ class FrameScanner:
 
         return self.scan(source_code, str(path))
 
-    def scan_directory(self, dirpath: str, pattern: str = "**/*.py") -> List[ScanResult]:
+    def scan_directory(self, dirpath: str, pattern: str = "**/*.py", *,
+                       skip_tests: bool = False, exclude_dirs=()) -> List[ScanResult]:
         """
         Scan all matching files in a directory.
 
         Args:
             dirpath: Directory path
             pattern: Glob pattern for files
+            skip_tests: Leave out test code by each language's convention
+                (see is_test_path). Off by default.
+            exclude_dirs: Globs for directories to leave out (see
+                is_excluded_dir), matched relative to dirpath.
 
         Returns:
             List of ScanResult for each file
@@ -1165,6 +1235,15 @@ class FrameScanner:
         try:
             for filepath in dir_path.glob(pattern):
                 if filepath.is_file():
+                    if skip_tests or exclude_dirs:
+                        try:
+                            rel = filepath.relative_to(dir_path)
+                        except ValueError:
+                            rel = Path(filepath.name)
+                        if exclude_dirs and is_excluded_dir(rel, exclude_dirs):
+                            continue
+                        if skip_tests and is_test_path(rel):
+                            continue
                     if filepath.suffix.lower() == ".go" and skip_go_file(filepath, dir_path):
                         continue
                     result = self.scan_file(str(filepath))

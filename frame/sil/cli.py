@@ -56,6 +56,18 @@ def create_parser() -> argparse.ArgumentParser:
         help="Glob pattern for directory scan (default: **/*.py)"
     )
     scan_parser.add_argument(
+        "--skip-tests",
+        action="store_true",
+        help="Skip test code by language convention (off by default). Go: *_test.go (always skipped) plus directories test/, tests/, e2e/, testdata/, testing/; Python: test_*.py, *_test.py, conftest.py, test/, tests/; JS/TS: *.test.*, *.spec.*, __tests__/; Java: src/test/; C#: directories containing 'Tests'; C/C++: test/, tests/. Directories are matched below the scan root only; an explicitly named file is always scanned."
+    )
+    scan_parser.add_argument(
+        "--exclude-dir",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="Skip directories matching this glob (repeatable). A pattern without '/' matches any directory name (e.g. 'vendor', '*_mock'); a pattern with '/' matches a directory path relative to the scan root, where '*' also matches '/' (e.g. 'staging/*', 'pkg/*/testing'). Ignored for single-file scans."
+    )
+    scan_parser.add_argument(
         "-f", "--format",
         default="text",
         choices=["text", "json", "sarif"],
@@ -330,7 +342,10 @@ def cmd_scan(args) -> int:
             result = scanner.scan_file(str(target))
             results.append(result)
         else:
-            results = scanner.scan_directory(str(target), args.pattern)
+            results = scanner.scan_directory(
+                str(target), args.pattern,
+                skip_tests=getattr(args, "skip_tests", False),
+                exclude_dirs=getattr(args, "exclude_dir", None) or ())
     except LLMUnavailableError as e:
         print(f"Error: LLM layer unavailable -- scan aborted (findings NOT reliable): {e}",
               file=sys.stderr)

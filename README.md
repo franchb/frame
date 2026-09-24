@@ -59,6 +59,10 @@ frame scan app.py
 # Scan a directory
 frame scan src/ --pattern "**/*.py"
 
+# Leave out test code (per-language conventions, off by default) and directories
+# matching a glob (name, or a path relative to the scan root; repeatable)
+frame scan ./repo -p "**/*.go" --skip-tests --exclude-dir "staging/*"
+
 # AI-assisted scan: LLM detection + triage (needs an LLM endpoint, see below)
 frame scan src/ --ai
 
