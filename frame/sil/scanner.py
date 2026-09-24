@@ -863,6 +863,7 @@ class FrameScanner:
 
             program = self.frontend.translate(source_code, filename)
             result.procedures_analyzed = len(program.procedures)
+            result.warnings.extend(getattr(program, "warnings", None) or [])
 
             if self.verbose:
                 print(f"[Scanner] Found {len(program.procedures)} procedures")

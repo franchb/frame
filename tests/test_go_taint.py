@@ -1120,3 +1120,42 @@ def test_source_call_assigned_over_sanitized_var_fires():
     _pair("CWE-22",
           _handler('p := filepath.Base(r.FormValue("x"))\np = r.FormValue("p")\nos.Open(p)', FS),
           _handler('p := r.FormValue("p")\np = filepath.Base(r.FormValue("x"))\nos.Open(p)', FS))
+
+
+# --- Deep expressions (Kubernetes allocator_testing.go: a 1,870-entry
+# composite literal lowered to a left-deep `+` chain overflowed the
+# translator's __str__ recursion, and the whole file lost its findings).
+
+def test_huge_composite_literal_scans_and_keeps_findings():
+    elems = ", ".join(["a"] * 2000)
+    body = f'a := "x"\nt := []string{{{elems}}}\n_ = t\nexec.Command(r.FormValue("c"))'
+    assert "CWE-78" in _cwes(_handler(body, EX))
+
+
+def test_huge_composite_literal_still_propagates_taint():
+    elems = ", ".join(["a"] * 1000 + ["u"] + ["a"] * 1000)
+    body = f'a := "x"\nu := r.FormValue("c")\nt := []string{{{elems}}}\nexec.Command(t[0])'
+    assert "CWE-78" in _cwes(_handler(body, EX))
+
+
+def test_long_concatenation_chain_scans():
+    chain = " + ".join(["a"] * 1500)
+    body = f'a := r.FormValue("c")\nexec.Command({chain})'
+    assert "CWE-78" in _cwes(_handler(body, EX))
+
+
+def test_function_skipped_for_recursion_is_reported_and_siblings_still_scan(monkeypatch):
+    from frame.sil.frontends.go_frontend import GoFrontend
+    original = GoFrontend._lower_function
+
+    def lower(self, node, name=None, outer_scope=None):
+        if name is None and self._t(node.child_by_field_name("name")) == "deep":
+            raise RecursionError("maximum recursion depth exceeded")
+        return original(self, node, name=name, outer_scope=outer_scope)
+
+    monkeypatch.setattr(GoFrontend, "_lower_function", lower)
+    src = _handler('exec.Command(r.FormValue("c"))', EX, "func deep() {}")
+    result = FrameScanner(language="go", verify=False).scan(src, "t.go")
+    assert not result.errors
+    assert "CWE-78" in {v.cwe_id for v in result.vulnerabilities}
+    assert any("'deep'" in w and "line" in w for w in result.warnings), result.warnings

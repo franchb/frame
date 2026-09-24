@@ -52,6 +52,31 @@ from frame.sil.specs.go_specs import (
 _EMPTY = ProcSpec(description="Go: result carries no taint")
 _STRING_LITERALS = ("interpreted_string_literal", "raw_string_literal")
 
+# Chains of an associative operator longer than this are folded as a balanced
+# tree instead of left-deep. The translator walks expressions recursively
+# (`__str__`, free variables) at the default recursion limit, so a 2,000-entry
+# composite literal or `+` chain lowered left-deep crashed the whole file.
+# Short chains keep the left-deep shape, so ordinary code lowers unchanged.
+_BALANCE_ABOVE = 64
+_ASSOCIATIVE_OPS = frozenset({"+", "&&", "||"})
+
+
+def _fold(op: str, exps: List[Exp]) -> Exp:
+    """`e0 op e1 op ... op eN`, operand order preserved: left-deep for short
+    chains, balanced (depth log2 N) for long ones."""
+    if len(exps) <= _BALANCE_ABOVE:
+        acc = exps[0]
+        for e in exps[1:]:
+            acc = ExpBinOp(op, acc, e)
+        return acc
+    level = list(exps)
+    while len(level) > 1:
+        nxt = [ExpBinOp(op, level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
+        if len(level) % 2:
+            nxt.append(level[-1])
+        level = nxt
+    return level[0]
+
 
 def _same(a, b) -> bool:
     """tree-sitter returns a fresh wrapper per access, so `is` is always False;
@@ -115,7 +140,12 @@ class GoFrontend:
                     try:
                         self._lower_function(node)
                     except RecursionError:
-                        continue          # pathological nesting: skip this function
+                        # Pathological nesting: skip this function, not the file.
+                        fname = self._t(node.child_by_field_name("name"))
+                        self._program.warnings.append(
+                            f"Go frontend skipped function '{fname}' at line "
+                            f"{node.start_point[0] + 1}: nesting too deep to lower")
+                        continue
             self._after_lowering()
         finally:
             sys.setrecursionlimit(old_limit)
@@ -519,11 +549,15 @@ class GoFrontend:
             if n != "_" and t.path != "error" and not (i == len(named) - 1 and n == "err")]
         self._on_function_start(node, receiver[0] if receiver else "",
                                 {n for n, _ in params if n})
-        self._emit_param_sources(node, proc, receiver, params)
-        self._lower_block(node.child_by_field_name("body"))
-        self._end_proc()
-        self._on_function_end()
-        self._restore(saved)
+        try:
+            self._emit_param_sources(node, proc, receiver, params)
+            self._lower_block(node.child_by_field_name("body"))
+            self._end_proc()
+        finally:
+            # Also on a RecursionError skip, so the trust oracle's frame stack
+            # and the lowering state do not leak into the next function.
+            self._on_function_end()
+            self._restore(saved)
         return name
 
     def _emit_param_sources(self, node, proc, receiver, params) -> None:
@@ -728,8 +762,8 @@ class GoFrontend:
                 if not (i < len(results) and results[i].path == "error")]
         if not values:                      # bare return: the named results
             kept = [ExpVar(PVar(n)) for n in (self._named_results or [])]
-        for v in kept:
-            value = v if value is None else ExpBinOp("+", value, v)
+        if kept:
+            value = _fold("+", kept)
         if value is not None:
             ret_var = self._new_ident("ret")
             ret_assign = Assign(loc=loc, id=ret_var, exp=value)
@@ -883,9 +917,7 @@ class GoFrontend:
                     conds.append(ExpBinOp("==", tag, ve) if tag is not None else ve)
                 if not conds:
                     continue
-                cond = conds[0]
-                for c in conds[1:]:
-                    cond = ExpBinOp("||", cond, c)
+                cond = _fold("||", conds)
                 nxt = self._new_node()
                 self._branch(test, cond, case_nodes[i], nxt, loc,
                              PruneKind.SWITCH_CASE, PruneKind.SWITCH_CASE)
@@ -1046,7 +1078,19 @@ class GoFrontend:
                 return operand
             return ExpUnOp(op, operand)
         if t == "binary_expression":
-            return ExpBinOp(self._op(node), self._lower_expr(node.child_by_field_name("left")),
+            op = self._op(node)
+            if op in _ASSOCIATIVE_OPS:
+                # Walk the left spine of a same-operator chain iteratively.
+                operands = [node.child_by_field_name("right")]
+                left = node.child_by_field_name("left")
+                while left is not None and left.type == "binary_expression" \
+                        and self._op(left) == op:
+                    operands.append(left.child_by_field_name("right"))
+                    left = left.child_by_field_name("left")
+                operands.append(left)
+                operands.reverse()
+                return _fold(op, [self._lower_expr(o) for o in operands])
+            return ExpBinOp(op, self._lower_expr(node.child_by_field_name("left")),
                             self._lower_expr(node.child_by_field_name("right")))
         if t == "composite_literal":
             return self._lower_composite(node, loc)
@@ -1075,10 +1119,7 @@ class GoFrontend:
         dynamic = [v for v in values if not isinstance(v, ExpConst)]
         if not dynamic:
             return self._opaque(loc)
-        acc = dynamic[0]
-        for v in dynamic[1:]:
-            acc = ExpBinOp("+", acc, v)
-        return acc
+        return _fold("+", dynamic)
 
     # ------------------------------------------------------------------ calls
     def _lower_call(self, node, pre_args=None, pre_recv=None) -> Exp:
@@ -1194,10 +1235,7 @@ class GoFrontend:
     def _join(exps: List[Exp]) -> Exp:
         if not exps:
             return ExpConst.string("")
-        acc = exps[0]
-        for e in exps[1:]:
-            acc = ExpBinOp("+", acc, e)
-        return acc
+        return _fold("+", exps)
 
     def _apply_out_params(self, key: str, arg_nodes, out: Exp, loc) -> None:
         for idx in OUT_PARAMS.get(key, ()):
