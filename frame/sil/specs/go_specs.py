@@ -94,6 +94,15 @@ GO_SPECS["net/http.NewRequest"] = _sink(SSRF, [1], "http.NewRequest(method, url,
 GO_SPECS["net/http.NewRequestWithContext"] = _sink(
     SSRF, [2], "http.NewRequestWithContext(ctx, method, url, body)", propagates=[2])
 
+# Sink positions that do not fire on the default propagation of a call the
+# frontend cannot resolve alone (go_frontend._unresolved_only): the exec
+# program name and the redirect / SSRF destination.
+UNRESOLVED_GUARDED_ARGS: Dict[str, int] = {
+    **SHELL_COMMAND_KEYS,
+    **{k: s.sink_args[0] for k, s in GO_SPECS.items()
+       if s.is_sink in (REDIRECT, SSRF) and s.sink_args},
+}
+
 # --- CWE-79 (explicit escape bypass only) ---------------------------------------------------
 GO_SPECS["html/template.HTML"] = _sink(HTML, [0], "template.HTML(x) marks x trusted", propagates=[0])
 

@@ -405,26 +405,75 @@ Bracketed numbers are the sink argument index.
 | 79 | `HTML_OUTPUT` | `template.HTML(x)` conversion [0] only |
 | 770 | `ALLOC_SIZE` | `make([]T, n)` [len and cap]; `strings.Repeat`, `bytes.Repeat` [1] |
 
-**Program name from an unresolved call (CWE-78).** At the program-name
-argument of `exec.Command` [0] / `exec.CommandContext` [1] (not the retargeted
-`sh -c` script), the site's sink is dropped when the argument's value is, on
-every path reaching the call, exactly the result of an *unresolved
-bare-identifier call*: `f(...)` where `f` is not a local, not a function, type,
-package variable or constant declared in this file, and not a builtin or
-builtin type -- in practice a same-package function in another file (e.g. a
-`_linux.go` / `_windows.go` variant, as in Kubernetes'
-`cmdStr, args, env, err := getLoggingCmd(n, services)`). Default unknown-call
-propagation still taints those results for every other sink and for further
-propagation; it is just not evidence enough that the executable is
-attacker-chosen. Definitions are tracked flow-sensitively beside the guard
-facts (any other assignment clears one, joins intersect, loop heads and labels
-clear, deferred emission is excluded). Unresolved method calls, package-qualified
-calls and the `sh -c` retarget are unaffected. Stated recall loss:
-`exec.Command(lookup(r.FormValue("c")))` with `lookup` defined in another file
-of the package is silent, and so is a cross-file type conversion,
-`exec.Command(Bin(r.FormValue("c")))` with `type Bin string` declared in another
-file (a per-file frontend cannot tell a conversion from a call). Phase B's
-package-scope summaries remove both.
+**Program name or destination from an unresolved call (CWE-78, 601, 918).**
+The rule applies to one argument per sink, listed in
+`UNRESOLVED_GUARDED_ARGS`: the program name of `exec.Command` [0] /
+`exec.CommandContext` [1] (not the retargeted `sh -c` script), the destination
+of `http.Redirect` [2] and gin / echo `c.Redirect` [1], and the URL of
+`http.Get` / `Head` / `Post` / `PostForm` [0], `http.NewRequest` [1],
+`http.NewRequestWithContext` [2] and `(*http.Client).Get` / `Head` / `Post`
+[0]. At that argument the site's sink is dropped when the argument's value is,
+on every path reaching the call, exactly the result of an *unresolved call*.
+The value may be that result itself, a field or index read of it
+(`start.LoginURL`), or a variable whose current definition is one of those.
+There are two kinds of unresolved call:
+
+- *Bare-identifier call.* `f(...)` where `f` is not a local, and not a
+  function, type, package variable or constant declared in this file, and not
+  a builtin or builtin type. In practice this is a same-package function in
+  another file, for example a `_linux.go` / `_windows.go` variant, as in
+  Kubernetes' `cmdStr, args, env, err := getLoggingCmd(n, services)`.
+- *Method call on a service-like receiver.* This is a method call that the
+  frontend lowers by default propagation: no spec, and no method declared in
+  this file. The receiver's type must be unknown, declared in this package, or
+  imported from a package that no spec models. That excludes the standard
+  library and the modelled frameworks, whose unmodelled methods remain
+  library behaviour. The receiver must also be unresolved-only itself, or be
+  rooted at a parameter, the method receiver, a variable captured from an
+  enclosing function, or a package-level variable. A local assigned in the
+  current body does not qualify, and neither does a named result or a request
+  / server-context value.
+
+  The usual shape is an interface or other-package service that a handler
+  passes a request value to. For example, an auth start handler runs
+  `start, err := svc.Begin(r.URL.Query().Get("idp"))` and then
+  `http.Redirect(w, r, start.LoginURL, 302)`: the identity-provider name
+  only selects a configured identity provider, and the URL comes from its
+  configuration. A local built from request data is data, not a service, so
+  `f := form{Next: r.FormValue("n")}; http.Redirect(w, r, f.Target(), 302)`
+  keeps firing when `Target` lives in another file.
+
+Neither kind counts when an argument hands over the request object itself
+(`r`, `&r`, `r.Header`, a gin / echo `c`) rather than a value read from it.
+Such a call is an accessor in disguise, for example a cookie or session
+reader or a binder, so its result is request data:
+`to, _ := sc.Cookie(r, "to"); http.Redirect(w, r, to, 302)` keeps firing.
+Request accessors (`r.FormValue`, `r.URL.Query().Get`, `c.Query`) resolve
+through the known source types and specs, so they are never unresolved.
+Default unknown-call propagation still taints the results for every other
+sink and for further propagation. It is just not evidence enough that the
+executable or destination is attacker-chosen. Definitions are tracked
+flow-sensitively beside the guard facts: any other assignment clears one,
+joins intersect, loop heads and labels clear, and deferred emission is
+excluded. Package-qualified calls and the `sh -c` retarget are unaffected.
+
+Stated recall loss: a destination or program name that is built from request
+data inside a call this frontend cannot see is missed. Examples:
+
+- `exec.Command(lookup(r.FormValue("c")))` or
+  `http.Get(endpointFor(r.FormValue("h")))` with the helper in another file of
+  the package.
+- `http.Redirect(w, r, svc.Resolve(r.FormValue("next")), 302)` where
+  `Resolve` returns its argument.
+- A non-handler function whose parameter is tainted by a same-file caller and
+  is read through a cross-file method, as in
+  `func fetch(t Target) { http.Get(t.URL()) }`.
+- A cross-file type conversion such as `exec.Command(Bin(r.FormValue("c")))`
+  with `type Bin string` declared in another file. A per-file frontend cannot
+  tell a conversion from a call.
+
+Phase B's package-scope summaries, and its resolution of interface method
+sets, remove these losses.
 
 Deliberate exclusions: parameter arguments of parameterized queries;
 `exec.Command("git", tainted...)` (CWE-88, out of scope); `os.Root` and its

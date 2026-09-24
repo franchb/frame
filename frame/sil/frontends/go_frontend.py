@@ -47,9 +47,25 @@ from frame.sil.specs.go_specs import (
     MAKE_SLICE_SPEC, NON_PROPAGATING_CALLS, NON_PROPAGATING_FIELDS, NORETURN,
     OUT_PARAMS, RECEIVER_MUTATION, REQUEST_TYPE, RESPONSE_WRITER, RESULT_TYPES,
     SERVER_CONTEXT_TYPES, SHELL_COMMAND_KEYS, SHELL_FLAGS, SHELL_NAMES,
+    UNRESOLVED_GUARDED_ARGS,
 )
 
 _EMPTY = ProcSpec(description="Go: result carries no taint")
+
+
+def _package_of(path: str) -> str:
+    """'net/http' for 'net/http.Request' or 'net/http.Client.Get'; '' for a
+    name declared in this package ('Server')."""
+    cut = path.rfind("/") + 1
+    dot = path.find(".", cut)
+    return path[:dot] if dot >= 0 else ""
+
+
+# Imported packages some spec models: an unmodelled method on one of their
+# types is still library behaviour, not a service of this program.
+_MODELED_PACKAGES = frozenset(
+    _package_of(k) for k in (*GO_SPECS, *FIELD_TYPES, *RESULT_TYPES, *SERVER_CONTEXT_TYPES,
+                             *NON_PROPAGATING_CALLS, *OUT_PARAMS, *RECEIVER_MUTATION)) - {""}
 _STRING_LITERALS = ("interpreted_string_literal", "raw_string_literal")
 
 # Chains of an associative operator longer than this are folded as a balanced
@@ -133,8 +149,11 @@ class GoFrontend:
         self._node: Optional[Node] = None
         self._last_call_key: Optional[str] = None
         # SIL variables whose current definition, on every path here, is the
-        # result of an unresolved bare-identifier call (see _unresolved_only).
+        # result of an unresolved call (see _unresolved_only).
         self._unresolved_defs: Set[str] = set()
+        # (start, end) bytes of method calls lowered by default propagation
+        # on a service-like receiver (see _unresolved_method).
+        self._unresolved_method_calls: Set[Tuple[int, int]] = set()
         self._emitting_defers = False
         old_limit = sys.getrecursionlimit()
         sys.setrecursionlimit(max(old_limit, 20000))
@@ -523,7 +542,7 @@ class GoFrontend:
         self._program.add_procedure(self._proc)
 
     _STATE = ("_proc", "_node", "_exit", "_scope", "_defers", "_breakables",
-              "_labels", "_gotos", "_last_call_key", "_named_results")
+              "_labels", "_gotos", "_last_call_key", "_named_results", "_result_vars")
 
     def _save(self):
         return {k: getattr(self, k, None) for k in self._STATE} | {"facts": self._facts_snapshot()}
@@ -564,6 +583,7 @@ class GoFrontend:
         named = [(n, t) for n, t in results if n]
         for rname, rtype in named:
             self._scope.declare(rname, rtype)
+        self._result_vars = frozenset(n for n, _ in named)
         self._named_results = [
             n for i, (n, t) in enumerate(named)
             if n != "_" and t.path != "error" and not (i == len(named) - 1 and n == "err")]
@@ -1182,7 +1202,7 @@ class GoFrontend:
                 return self._lower_package_call(pkg, member, arg_nodes, args(), loc)
             recv_exp = pre_recv if pre_recv is not None else self._lower_expr(operand)
             return self._lower_method_call(operand, recv_exp, self._type_of(operand),
-                                           member, arg_nodes, args(), loc)
+                                           member, arg_nodes, args(), loc, call_node=node)
         callee = self._lower_expr(fn)
         return self._emit_call(loc, f"{self._materialize(callee, loc)}()", args())
 
@@ -1234,7 +1254,7 @@ class GoFrontend:
         return out
 
     def _lower_method_call(self, operand, recv_exp, recv_type: GoType, member, arg_nodes,
-                           arg_exps, loc) -> Exp:
+                           arg_exps, loc, call_node=None) -> Exp:
         key = f"{recv_type.path}.{member}" if recv_type.known else None
         if key is not None and key in NON_PROPAGATING_CALLS:
             self._last_call_key = key
@@ -1253,6 +1273,9 @@ class GoFrontend:
                 self._assign_target(operand, ExpBinOp("+", recv_exp, self._join(arg_exps)),
                                     False, recv_type, None)
             return out
+        if (call_node is not None and self._service_receiver(operand, recv_type)
+                and not self._passes_request(arg_nodes)):
+            self._unresolved_method_calls.add((call_node.start_byte, call_node.end_byte))
         recv_var = self._materialize(recv_exp, loc)
         return self._emit_call(loc, f"{recv_var}.{member}", arg_exps, key=key)
 
@@ -1279,11 +1302,14 @@ class GoFrontend:
             if (len(arg_nodes) > off + 2 and self._const_str(arg_nodes[off]) in SHELL_NAMES
                     and self._const_str(arg_nodes[off + 1]) in SHELL_FLAGS):
                 return replace(spec, sink_args=[off + 2])
-            # Program-name position: a value whose only definition is the
-            # result of a function this file cannot see carries taint only by
-            # default propagation (every input to every result). That is kept
-            # for every other sink and for further propagation, but is not
-            # evidence enough that the executable itself is attacker-chosen.
+        if key in UNRESOLVED_GUARDED_ARGS and spec is not None:
+            # Program name / redirect or SSRF destination: a value whose only
+            # definition is the result of a call this file cannot see carries
+            # taint only by default propagation (every input to every result).
+            # That is kept for every other sink and for further propagation,
+            # but is not evidence enough that the executable or the
+            # destination itself is attacker-chosen.
+            off = UNRESOLVED_GUARDED_ARGS[key]
             if (len(arg_nodes) > off and not self._emitting_defers
                     and self._unresolved_only(arg_nodes[off])):
                 return replace(spec, is_sink=None, sink_args=[])
@@ -1308,19 +1334,87 @@ class GoFrontend:
         return (self._scope_lookup(name) is None and name not in env.funcs
                 and name not in env.local_types and name not in env.package_vars
                 and name not in env.consts and name not in BUILTIN_TYPES
-                and name not in self._NON_CALL_BUILTINS and name not in EMPTY_BUILTINS)
+                and name not in self._NON_CALL_BUILTINS and name not in EMPTY_BUILTINS
+                and not self._passes_request(self._arg_nodes(node)))
+
+    def _passes_request(self, arg_nodes) -> bool:
+        """Does an argument hand over the request object itself (`r`, `&r`,
+        `r.Header`, `c` for a server context) rather than a value read from it?
+        A call that takes the request is an accessor in disguise (a cookie or
+        session reader, a binder): its result is request data."""
+        for arg in arg_nodes:
+            node = arg
+            while node is not None and node.type in ("parenthesized_expression",
+                                                     "unary_expression", "selector_expression"):
+                node = (node.child_by_field_name("operand") if node.type != "parenthesized_expression"
+                        else (node.named_children[0] if node.named_children else None))
+            if node is not None and node.type == "identifier":
+                typ = self._scope_lookup(self._t(node))
+                if typ is not None and (typ.path == REQUEST_TYPE or typ.path in SERVER_CONTEXT_TYPES):
+                    return True
+        return False
 
     def _unresolved_only(self, node) -> bool:
         """Is this value, on every path reaching here, exactly the result of an
-        unresolved bare-identifier call (directly, or through a variable whose
-        current definition is one)?"""
+        unresolved call -- a bare-identifier call this file cannot see, or a
+        method call on a service-like receiver (_service_receiver) -- directly,
+        through a field / index read of one, or through a variable whose
+        current definition is one?"""
         while node is not None and node.type == "parenthesized_expression" and node.named_children:
             node = node.named_children[0]
         if node is None:
             return False
         if node.type == "identifier":
             return self._sil(self._t(node)) in self._unresolved_defs
+        if node.type in ("selector_expression", "index_expression"):
+            operand = node.child_by_field_name("operand")
+            return not self._is_package_alias(operand) and self._unresolved_only(operand)
+        if node.type == "call_expression" \
+                and (node.start_byte, node.end_byte) in self._unresolved_method_calls:
+            return True
         return self._is_unresolved_bare_call(node)
+
+    def _service_receiver(self, operand, recv_type: GoType) -> bool:
+        """May an unresolved method on this receiver count as unresolved-only?
+
+        Only a receiver that looks like a service of this program, not data:
+        its type is unknown, declared in this package, or imported from a
+        package no spec models (not the standard library); and it is itself
+        unresolved-only, or rooted at a parameter, the method receiver, a
+        captured or package-level variable -- never at a local this body
+        assigns (`f := form{Next: r.FormValue("n")}; f.Target()` keeps its
+        taint) nor at a request / server-context value."""
+        path = recv_type.path
+        if path:
+            if "." in path:
+                pkg = _package_of(path)
+                if not pkg or "." not in pkg.split("/")[0] or pkg in _MODELED_PACKAGES:
+                    return False
+            elif not re.fullmatch(r"[A-Za-z_]\w*", path) or path in BUILTIN_TYPES:
+                return False
+        if self._unresolved_only(operand):
+            return True
+        root = operand
+        while root is not None and root.type in ("selector_expression", "index_expression",
+                                                 "parenthesized_expression"):
+            if root.type == "selector_expression" and self._is_package_alias(
+                    root.child_by_field_name("operand")):
+                return True                                 # pkg.Var: package state
+            root = (root.child_by_field_name("operand") if root.type != "parenthesized_expression"
+                    else (root.named_children[0] if root.named_children else None))
+        if root is None or root.type != "identifier":
+            return False
+        name = self._t(root)
+        typ = self._scope_lookup(name)
+        if typ is not None and (typ.path == REQUEST_TYPE or typ.path in SERVER_CONTEXT_TYPES):
+            return False
+        scope = self._scope
+        while scope is not None and not scope.proc_root:
+            if name in scope.names:
+                return False                                # a local of this body
+            scope = scope.parent
+        return not (scope is not None and name in scope.names
+                    and name in (getattr(self, "_result_vars", None) or ()))
 
     def _call_key(self, node) -> Optional[str]:
         """The canonical key of a call node (package function or typed method),

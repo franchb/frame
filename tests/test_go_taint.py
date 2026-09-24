@@ -1251,3 +1251,171 @@ def test_non_associative_chains_keep_their_shape():
     while isinstance(exp, ExpBinOp):
         exp, depth = exp.left, depth + 1
     assert depth == 79          # left-deep: `-` is not reassociated
+
+
+# --- Redirect / SSRF destination from a call this file cannot see. An auth
+# start handler passes a request value (which configured identity provider)
+# to an interface / other-package service method and redirects to a URL field
+# of its result, which the service builds from its own configuration. Default
+# propagation taints that result from the argument; the destination position
+# does not fire on that taint alone, as for the exec program name above.
+
+_LOGIN_START = '''package main
+import (
+"net/http"
+"example.com/app/auth"
+)
+const idpParam = "idp"
+func NewStart(svc *auth.Service) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, err := svc.Begin(r.URL.Query().Get(idpParam))
+		if err != nil { http.Error(w, err.Error(), 400); return }
+		BODY
+	})
+}
+'''
+
+
+def test_redirect_to_service_method_result_field_is_silent():
+    _pair("CWE-601",
+          _LOGIN_START.replace("BODY", 'http.Redirect(w, r, r.URL.Query().Get("next"), 302)'),
+          _LOGIN_START.replace("BODY", "http.Redirect(w, r, start.LoginURL, http.StatusFound)"))
+
+
+def test_redirect_to_service_method_result_through_variable_is_silent():
+    _pair("CWE-601",
+          _LOGIN_START.replace("BODY", 'u := r.FormValue("next")\nhttp.Redirect(w, r, u, 302)'),
+          _LOGIN_START.replace("BODY", "u := start.LoginURL\nhttp.Redirect(w, r, u, 302)"))
+
+
+def test_redirect_to_field_service_method_on_captured_receiver_is_silent():
+    src = '''package main
+import (
+"net/http"
+"example.com/app/auth"
+)
+type Handler struct{ svc *auth.Service }
+func (h *Handler) Start() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, err := h.svc.Begin(r.URL.Query().Get("idp"))
+		if err != nil { return }
+		http.Redirect(w, r, DEST, http.StatusFound)
+	})
+}
+'''
+    _pair("CWE-601", src.replace("DEST", 'r.URL.Query().Get("next")'),
+          src.replace("DEST", "start.LoginURL"))
+
+
+def test_redirect_to_interface_method_result_is_silent():
+    src = _handler('info, err := idps.Begin(r.FormValue("idp"))\nif err != nil { return }\n'
+                   'http.Redirect(w, r, DEST, 302)', RD,
+                   "type Starter interface{ Begin(string) (Info, error) }\nvar idps Starter")
+    _pair("CWE-601", src.replace("DEST", 'r.FormValue("next")'),
+          src.replace("DEST", "info.LoginURL"))
+
+
+def test_redirect_to_same_package_function_in_other_file_is_silent():
+    _pair("CWE-601",
+          _handler('u := r.FormValue("idp")\nhttp.Redirect(w, r, u, 302)', RD),
+          _handler('u, err := loginURL(r.FormValue("idp"))\nif err != nil { return }\n'
+                   'http.Redirect(w, r, u, 302)', RD))
+    assert "CWE-601" not in _cwes(_handler(
+        'http.Redirect(w, r, lookupIdP(r.FormValue("idp")).LoginURL, 302)', RD))
+
+
+def test_framework_redirect_to_service_result_is_silent():
+    src = '''package main
+import (
+"github.com/gin-gonic/gin"
+"example.com/app/auth"
+)
+var svc *auth.Service
+func h(c *gin.Context) {
+	start, _ := svc.Begin(c.Query("idp"))
+	c.Redirect(302, DEST)
+}'''
+    _pair("CWE-601", src.replace("DEST", 'c.Query("next")'), src.replace("DEST", "start.LoginURL"))
+
+
+def test_ssrf_destination_from_service_result_is_silent():
+    imports = '"context"\n"net/http"'
+    lookup = 'ep, err := registry.Endpoint(r.FormValue("svc"))\nif err != nil { return }\n'
+    extra = "type Registry interface{ Endpoint(string) (Info, error) }\nvar registry Registry"
+    for call in ("http.Get(DEST)", "http.Post(DEST, \"text/plain\", nil)",
+                 'http.NewRequest("GET", DEST, nil)',
+                 'http.NewRequestWithContext(context.Background(), "GET", DEST, nil)',
+                 "c := &http.Client{}\nc.Get(DEST)"):
+        _pair("CWE-918", _handler(lookup + call.replace("DEST", 'r.FormValue("u")'), imports, extra),
+              _handler(lookup + call.replace("DEST", "ep.URL"), imports, extra))
+    assert "CWE-918" not in _cwes(_handler(
+        'u := endpointFor(r.FormValue("svc"))\nhttp.Get(u)', imports))
+
+
+def test_service_result_is_still_tainted_for_other_sinks():
+    imports = '"net/http"\n"os"'
+    assert "CWE-22" in _cwes(_handler(
+        'info, _ := store.Lookup(r.FormValue("id"))\nos.Open(info.Path)', imports,
+        "type Store interface{ Lookup(string) (Info, error) }\nvar store Store"))
+
+
+def test_destination_with_direct_request_evidence_still_fires():
+    assert "CWE-601" in _cwes(_handler('http.Redirect(w, r, r.URL.Query().Get("next"), 302)', RD))
+    assert "CWE-601" in _cwes(_handler(
+        'q := r.URL.Query()\nhttp.Redirect(w, r, q.Get("next"), 302)', RD))
+    assert "CWE-601" in _cwes(_handler('next := r.FormValue("next")\nhttp.Redirect(w, r, next, 302)', RD))
+    assert "CWE-918" in _cwes(_handler('http.Get(r.FormValue("u"))', RD))
+    assert "CWE-918" in _cwes(_handler(
+        'http.Get(build(r.FormValue("h")))', RD, 'func build(h string) string { return "https://" + h }'))
+    assert "CWE-918" in _cwes(_handler(
+        'host := r.FormValue("h")\nhttp.Get(fmt.Sprintf("https://%s/x", host))', RD + '\n"fmt"'))
+
+
+def test_destination_from_data_receiver_method_still_fires():
+    # A local built from request data is data, not a service: its method in
+    # another file keeps the receiver's taint.
+    assert "CWE-601" in _cwes(_handler(
+        'f := form{Next: r.FormValue("n")}\nhttp.Redirect(w, r, f.Target(), 302)', RD,
+        "type form struct{ Next string }"))
+    # Unmodelled standard-library methods are library behaviour.
+    assert "CWE-918" in _cwes(_handler(
+        'var b strings.Builder\nb.WriteString(r.FormValue("u"))\nhttp.Get(b.String())', RD))
+    assert "CWE-918" in _cwes(_handler(
+        'u, _ := url.Parse(r.FormValue("u"))\nhttp.Get(u.String())', RD))
+
+
+def test_destination_reassigned_from_request_on_one_branch_fires():
+    assert "CWE-601" in _cwes(_LOGIN_START.replace(
+        "BODY", 'u := start.LoginURL\nif r.Method == "POST" { u = r.FormValue("next") }\n'
+                'http.Redirect(w, r, u, 302)'))
+
+
+def test_program_name_from_service_method_result_is_silent():
+    src = _handler('t, err := tools.Resolve(r.FormValue("t"))\nif err != nil { return }\n'
+                   'exec.Command(DEST).Run()', EX,
+                   "type Tools interface{ Resolve(string) (string, error) }\nvar tools Tools")
+    _pair("CWE-78", src.replace("DEST", 'r.FormValue("t")'), src.replace("DEST", "t"))
+
+
+def test_destination_from_call_taking_the_request_object_still_fires():
+    # Handing over the request itself (a cookie / session reader, a binder)
+    # makes the unresolved call an accessor: its result is request data.
+    src = '''package main
+import (
+"net/http"
+"example.com/app/cookies"
+)
+func NewCallback(sc *cookies.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		BODY
+	})
+}
+'''
+    for body in ('to, err := sc.Cookie(r, "to")\nif err != nil { return }\nhttp.Redirect(w, r, to, 302)',
+                 'to := sc.Read(r.Header, "to")\nhttp.Redirect(w, r, to, 302)',
+                 'to := nextFrom(r)\nhttp.Redirect(w, r, to, 302)',
+                 'http.Get(targetOf(&r))'):
+        assert _cwes(src.replace("BODY", body)) & {"CWE-601", "CWE-918"}, body
+    assert "CWE-601" in _cwes('''package main
+import "github.com/gin-gonic/gin"
+func h(c *gin.Context) { c.Redirect(302, nextFrom(c)) }''')
