@@ -1159,3 +1159,72 @@ def test_function_skipped_for_recursion_is_reported_and_siblings_still_scan(monk
     assert not result.errors
     assert "CWE-78" in {v.cwe_id for v in result.vulnerabilities}
     assert any("'deep'" in w and "line" in w for w in result.warnings), result.warnings
+
+
+# --- Program name from a function this file cannot see (Kubernetes
+# pkg/kubelet/kubelet_server_journal.go: `cmdStr, args, env, err :=
+# getLoggingCmd(n, services)` with getLoggingCmd in _linux.go / _windows.go).
+# Default propagation still taints the results; the program-name position of
+# exec.Command / CommandContext just does not fire on that taint alone.
+
+_UNRESOLVED_CTX = '''package main
+import ("context"; "net/http"; "os/exec")
+type q struct{ Services []string }
+func h(w http.ResponseWriter, r *http.Request) {
+	n := &q{Services: r.URL.Query()["svc"]}
+	n.copyLogs(r.Context(), n.Services)
+}
+func (n *q) copyLogs(ctx context.Context, services []string) {
+	cmdStr, args, cmdEnv, err := getLoggingCmd(n, services)
+	if err != nil { return }
+	cmd := exec.CommandContext(ctx, SINK, args...)
+	cmd.Env = cmdEnv
+	cmd.Run()
+}
+'''
+
+
+def test_program_name_from_unresolved_helper_is_silent_command_context():
+    _pair("CWE-78", _UNRESOLVED_CTX.replace("SINK", "services[0]"),
+          _UNRESOLVED_CTX.replace("SINK", "cmdStr"))
+
+
+def test_program_name_from_unresolved_helper_is_silent_command():
+    _pair("CWE-78",
+          _handler('c := r.FormValue("c")\nexec.Command(c).Run()', EX),
+          _handler('c, err := getCmd(r.FormValue("c"))\nif err != nil { return }\n'
+                   'exec.Command(c).Run()', EX))
+    assert "CWE-78" not in _cwes(_handler('exec.Command(getCmd(r.FormValue("c")))', EX))
+
+
+def test_unresolved_helper_result_is_still_tainted_for_other_sinks():
+    imports = EX + '\n"os"'
+    assert "CWE-22" in _cwes(_handler('p, _ := getPath(r.FormValue("p"))\nos.Open(p)', imports))
+
+
+def test_unresolved_helper_result_still_fires_through_sh_c_retarget():
+    assert "CWE-78" in _cwes(_handler(
+        's, _ := getScript(r.FormValue("c"))\nexec.Command("sh", "-c", s).Run()', EX))
+
+
+def test_program_name_with_direct_or_same_file_evidence_still_fires():
+    assert "CWE-78" in _cwes(_handler('exec.Command(r.FormValue("c")).Run()', EX))
+    assert "CWE-78" in _cwes(_handler('exec.Command(identity(r.FormValue("c"))).Run()', EX,
+                                      "func identity(s string) string { return s }"))
+    # A local function value is not an unresolved package-level call.
+    assert "CWE-78" in _cwes(_handler(
+        'f := func(s string) string { return s }\nexec.Command(f(r.FormValue("c"))).Run()', EX))
+
+
+def test_program_name_reassigned_from_source_fires():
+    assert "CWE-78" in _cwes(_handler(
+        'c, _ := getCmd("x")\nc = r.FormValue("c")\nexec.Command(c).Run()', EX))
+
+
+def test_program_name_reassigned_on_one_branch_fires():
+    assert "CWE-78" in _cwes(_handler(
+        'c, _ := getCmd(r.FormValue("a"))\nif r.Method == "POST" { c = r.FormValue("c") }\n'
+        'exec.Command(c).Run()', EX))
+    assert "CWE-78" in _cwes(_handler(
+        'c := r.FormValue("c")\nif r.Method == "POST" { c, _ = getCmd(c) }\n'
+        'exec.Command(c).Run()', EX))

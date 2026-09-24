@@ -129,6 +129,10 @@ class GoFrontend:
         self._proc: Optional[Procedure] = None
         self._node: Optional[Node] = None
         self._last_call_key: Optional[str] = None
+        # SIL variables whose current definition, on every path here, is the
+        # result of an unresolved bare-identifier call (see _unresolved_only).
+        self._unresolved_defs: Set[str] = set()
+        self._emitting_defers = False
         old_limit = sys.getrecursionlimit()
         sys.setrecursionlimit(max(old_limit, 20000))
         try:
@@ -180,6 +184,10 @@ class GoFrontend:
 
     def _on_assign(self, name: str, value_node) -> None:
         self._guards.on_assign(name, value_node)
+        if value_node is not None and self._unresolved_only(value_node):
+            self._unresolved_defs.add(name)
+        else:
+            self._unresolved_defs.discard(name)
 
     def _on_multi_assign(self, names: List[str], value_node) -> None:
         self._guards.on_multi_assign(names, value_node)
@@ -191,17 +199,26 @@ class GoFrontend:
         self._trust.leave()
 
     def _facts_snapshot(self):
-        return self._guards.snapshot() if hasattr(self, "_guards") else None
+        guards = self._guards.snapshot() if hasattr(self, "_guards") else None
+        return guards, frozenset(self._unresolved_defs)
 
     def _facts_restore(self, snap) -> None:
+        guards, unresolved = snap if snap is not None else (None, frozenset())
         if hasattr(self, "_guards"):
-            self._guards.restore(snap)
+            self._guards.restore(guards)
+        self._unresolved_defs = set(unresolved)
 
     def _facts_join(self, snaps) -> None:
         if hasattr(self, "_guards"):
-            self._guards.join(snaps)
+            self._guards.join([g for g, _ in snaps])
+        # Unresolved-only on every incoming path, or not at all.
+        self._unresolved_defs = (set(frozenset.intersection(*[u for _, u in snaps]))
+                                 if snaps else set())
 
     def _facts_clear(self) -> None:
+        # Loop heads and labels: any definition may reach, so nothing is
+        # unresolved-only (the program-name sink keeps firing).
+        self._unresolved_defs = set()
         if hasattr(self, "_guards"):
             self._guards.clear()
 
@@ -1008,8 +1025,13 @@ class GoFrontend:
         if self._node is None:
             return
         pending, self._defers = self._defers, []
-        for call, pre_args, pre_recv in reversed(pending):
-            self._lower_call(call, pre_args=pre_args, pre_recv=pre_recv)
+        # The definitions reaching an exit are not those at the `defer`.
+        was, self._emitting_defers = self._emitting_defers, True
+        try:
+            for call, pre_args, pre_recv in reversed(pending):
+                self._lower_call(call, pre_args=pre_args, pre_recv=pre_recv)
+        finally:
+            self._emitting_defers = was
         self._defers = pending
 
     # ------------------------------------------------------------- expressions
@@ -1254,9 +1276,48 @@ class GoFrontend:
             if (len(arg_nodes) > off + 2 and self._const_str(arg_nodes[off]) in SHELL_NAMES
                     and self._const_str(arg_nodes[off + 1]) in SHELL_FLAGS):
                 return replace(spec, sink_args=[off + 2])
+            # Program-name position: a value whose only definition is the
+            # result of a function this file cannot see carries taint only by
+            # default propagation (every input to every result). That is kept
+            # for every other sink and for further propagation, but is not
+            # evidence enough that the executable itself is attacker-chosen.
+            if (len(arg_nodes) > off and not self._emitting_defers
+                    and self._unresolved_only(arg_nodes[off])):
+                return replace(spec, is_sink=None, sink_args=[])
         if key in CONST_ARG0_EXEMPT and arg_nodes and self._const_str(arg_nodes[0]) is not None:
             return replace(spec, is_sink=None, sink_args=[]) if spec is not None else None
         return spec
+
+    _NON_CALL_BUILTINS = frozenset({"make", "append", "copy", "panic", "min", "max"})
+
+    def _is_unresolved_bare_call(self, node) -> bool:
+        """A call `f(...)` to a bare identifier that names nothing in this
+        file or the language: in practice a same-package function defined in
+        another file (e.g. a platform-specific `_linux.go` / `_windows.go`
+        variant), whose body and summary the per-file frontend cannot see."""
+        if node is None or node.type != "call_expression":
+            return False
+        fn = node.child_by_field_name("function")
+        if fn is None or fn.type != "identifier":
+            return False
+        name = self._t(fn)
+        env = self._env
+        return (self._scope_lookup(name) is None and name not in env.funcs
+                and name not in env.local_types and name not in env.package_vars
+                and name not in env.consts and name not in BUILTIN_TYPES
+                and name not in self._NON_CALL_BUILTINS and name not in EMPTY_BUILTINS)
+
+    def _unresolved_only(self, node) -> bool:
+        """Is this value, on every path reaching here, exactly the result of an
+        unresolved bare-identifier call (directly, or through a variable whose
+        current definition is one)?"""
+        while node is not None and node.type == "parenthesized_expression" and node.named_children:
+            node = node.named_children[0]
+        if node is None:
+            return False
+        if node.type == "identifier":
+            return self._sil(self._t(node)) in self._unresolved_defs
+        return self._is_unresolved_bare_call(node)
 
     def _call_key(self, node) -> Optional[str]:
         """The canonical key of a call node (package function or typed method),
