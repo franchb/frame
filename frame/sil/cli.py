@@ -47,8 +47,8 @@ def create_parser() -> argparse.ArgumentParser:
         "-l", "--language",
         default="python",
         help="Source language (default: python). Symbolic frontends: python, "
-             "javascript, typescript, java, c, cpp, csharp. Any other language "
-             "(e.g. php, ruby, go) runs LLM-detect only under --ai."
+             "javascript, typescript, java, c, cpp, csharp, go. Any other language "
+             "(e.g. php, ruby, rust) runs LLM-detect only under --ai."
     )
     scan_parser.add_argument(
         "-p", "--pattern",

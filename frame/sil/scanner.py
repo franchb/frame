@@ -402,6 +402,69 @@ def is_generated_source(source_code: str,
     return len(source_code) > limit and "\n" not in source_code
 
 
+_GO_SKIP_DIRS = frozenset({"vendor", "testdata", "third_party"})
+_GO_GENERATED_HEADER = re.compile(r"^// Code generated .* DO NOT EDIT\.\s*$", re.MULTILINE)
+
+
+def skip_go_file(path: Path, root: Path) -> bool:
+    """Go files a directory scan leaves out: vendored, test-data and
+    third-party trees, tests, and generated code (the standard `// Code
+    generated ... DO NOT EDIT.` header, with common generated filenames as a
+    fast path). None of them is the project's attack surface, and in
+    Kubernetes-scale repositories they dominate the file count."""
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        parts = path.parts
+    if any(p in _GO_SKIP_DIRS for p in parts[:-1]):
+        return True
+    name = path.name
+    if (name.endswith("_test.go") or name.endswith(".pb.go")
+            or name.startswith("zz_generated") or name.endswith("_mock.go")):
+        return True
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8192)
+    except OSError:
+        return False
+    # utf-8-sig strips a leading BOM so it never shifts line 1 into the marker
+    # search.
+    text = head.decode("utf-8-sig", errors="replace")
+    # Go's convention: the generated-code marker is only meaningful in the
+    # leading comment block, before the first non-comment, non-blank line
+    # (conventionally `package ...`). Searching the whole file would also
+    # match the same text sitting in a string literal or a later comment,
+    # which is real source -- e.g. a generator's own code that prints the
+    # marker -- not a generator's output. `/* ... */` block comments (the
+    # common license-header shape, e.g. Kubernetes generated files) are part
+    # of that leading run too and must be skipped over, not treated as the
+    # end of it.
+    leading_comments = []
+    in_block = False
+    for line in text.splitlines():
+        if in_block:
+            end = line.find("*/")
+            if end == -1:
+                continue
+            in_block = False
+            line = line[end + 2:]
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("//"):
+            leading_comments.append(line)
+            continue
+        if stripped.startswith("/*"):
+            end = stripped.find("*/", 2)
+            if end == -1:
+                in_block = True
+                continue
+            # Single-line block comment; keep scanning the rest of the file.
+            continue
+        break
+    return _GO_GENERATED_HEADER.search("\n".join(leading_comments)) is not None
+
+
 class FrameScanner:
     """
     Main vulnerability scanner.
@@ -736,6 +799,11 @@ class FrameScanner:
         elif language == "csharp":
             from frame.sil.frontends.csharp_frontend import CSharpFrontend
             return CSharpFrontend()
+        elif language == "go":
+            from frame.sil.frontends.go_frontend import GoFrontend
+            fe = GoFrontend()
+            fe.taint_exported_params = self.library_mode
+            return fe
         else:
             # No symbolic frontend for this language. Return None rather than raise:
             # under --ai the scan still runs the language-agnostic LLM-detect layer
@@ -782,6 +850,12 @@ class FrameScanner:
             result.scan_time_ms = (time.time() - start_time) * 1000
             return result
 
+        program = None
+        # Set True the moment step 7 (normal-path LLM detect) starts, even if
+        # it goes on to raise -- tells the except-path bypass below whether
+        # detect already ran, so it never re-runs it (a duplicate paid LLM
+        # call whose findings would also bypass step 8's triage).
+        detect_ran = False
         try:
             # Step 1: Parse source to SIL
             if self.verbose:
@@ -850,6 +924,7 @@ class FrameScanner:
             # missed (recall). Runs BEFORE triage so that, when both are enabled,
             # triage also filters the (noisier) detection findings.
             if self.llm_detect:
+                detect_ran = True
                 result.vulnerabilities = self._apply_llm_detect(
                     result.vulnerabilities, source_code, filename, program)
                 if self.verbose:
@@ -872,6 +947,30 @@ class FrameScanner:
             if self.verbose:
                 import traceback
                 traceback.print_exc()
+            # Go: a file that crashes the symbolic layer (e.g. a very long `+`
+            # chain hitting __str__ recursion) keeps the --ai detection pass it
+            # had before the frontend existed. Gated so other languages keep
+            # their current behaviour. Only run it here if step 7 never got a
+            # chance to (crash happened earlier) -- if step 7 already ran (and
+            # either it or step 8's triage is what raised), re-running detect
+            # here would be a duplicate paid LLM call whose findings also
+            # bypass triage. And this call gets its own try/except: detect can
+            # itself raise on a malformed LLM response (_apply_llm_detect only
+            # guards ImportError), and that must be recorded as a scan error
+            # rather than escaping scan().
+            if self.llm_detect and self.language == "go" and not detect_ran:
+                try:
+                    result.vulnerabilities = self._apply_llm_detect(
+                        result.vulnerabilities, source_code, filename, program)
+                except LLMUnavailableError:
+                    # Same rule as the outer handler above: an unreachable LLM
+                    # must propagate, not be swallowed into a "clean" scan --
+                    # the CLI depends on this to report "LLM layer unavailable"
+                    # and exit non-zero instead of silently returning no
+                    # findings.
+                    raise
+                except Exception as e2:
+                    result.errors.append(f"LLM detect error: {str(e2)}")
 
         result.scan_time_ms = (time.time() - start_time) * 1000
 
@@ -923,7 +1022,11 @@ class FrameScanner:
         # model on every file). For an unsupported language (LLM-only mode) the user
         # explicitly opted in with --ai, so detection always runs -- the heuristic's
         # patterns are tuned for the symbolic languages and would miss PHP/Ruby/etc.
-        if self.frontend is not None and not is_detection_candidate(source_code, bool(vulns)):
+        # Go keeps the always-run behaviour it had before its frontend existed:
+        # the candidate patterns are tuned for the other languages and would
+        # silently drop Go files with no symbolic finding from the LLM pass.
+        if (self.frontend is not None and self.language != "go"
+                and not is_detection_candidate(source_code, bool(vulns))):
             return vulns
         if self._llm_client is None:
             self._llm_client = LLMTriageClient(config)
@@ -999,6 +1102,7 @@ class FrameScanner:
             '.cxx': 'cpp',
             '.hpp': 'cpp',
             '.cs': 'csharp',
+            '.go': 'go',
         }
         detected_lang = ext_to_lang.get(path.suffix.lower(), self.language)
 
@@ -1008,7 +1112,11 @@ class FrameScanner:
             self.frontend = self._get_frontend(detected_lang)
 
         # Use utf-8-sig to automatically strip BOM (common in C# files)
-        source_code = path.read_text(encoding='utf-8-sig')
+        # Go sources in the wild carry the odd invalid byte in comments or
+        # string literals; tree-sitter recovers, so decode with replacement
+        # rather than failing the whole file.
+        errors = "replace" if path.suffix.lower() == ".go" else "strict"
+        source_code = path.read_text(encoding='utf-8-sig', errors=errors)
 
         # Minified and generated artifacts are not source: they are build output,
         # they are never the file a security advisory points at, and analysing them
@@ -1056,6 +1164,8 @@ class FrameScanner:
         try:
             for filepath in dir_path.glob(pattern):
                 if filepath.is_file():
+                    if filepath.suffix.lower() == ".go" and skip_go_file(filepath, dir_path):
+                        continue
                     result = self.scan_file(str(filepath))
                     results.append(result)
         finally:
@@ -1881,6 +1991,7 @@ def scan_file(filepath: str, language: str = None) -> ScanResult:
             ".h": "c",
             ".hpp": "cpp",
             ".cs": "csharp",
+            ".go": "go",
         }
         language = language_map.get(ext, "python")
 

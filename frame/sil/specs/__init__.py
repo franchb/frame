@@ -45,6 +45,12 @@ try:
 except ImportError:
     CSHARP_SPECS = {}
 
+# Go specs
+try:
+    from frame.sil.specs.go_specs import GO_SPECS
+except ImportError:
+    GO_SPECS = {}
+
 __all__ = [
     "PYTHON_SPECS",
     "get_python_specs",
@@ -54,4 +60,5 @@ __all__ = [
     "C_SPECS",
     "CPP_SPECS",
     "CSHARP_SPECS",
+    "GO_SPECS",
 ]

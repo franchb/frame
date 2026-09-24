@@ -1,0 +1,343 @@
+"""Same-file procedure summaries and into-callee taint for the Go frontend.
+
+Out of callees: Program.get_spec returns a same-file procedure's own ProcSpec,
+which is empty unless filled, so the translator never applies its unknown-call
+propagation and `identity(r.FormValue("x"))` would lose its taint. Every Go
+procedure therefore gets an explicit summary: which parameters (and receiver)
+reach a return, which sink kinds EVERY such flow is sanitized for, and whether
+a return can carry a source of its own. Callees are summarised before callers;
+a recursive cycle gets the conservative summary.
+
+Into callees: a tainted argument taints the callee's parameter at entry
+(a TaintSource tagged FIXPOINT_DESC), mirroring the Java frontend's fixpoint.
+Those tagged sources are excluded from `is_source`, so the two directions
+cannot feed each other.
+
+Both are flow-insensitive over the lowered SIL: a may-analysis for taint, a
+must-analysis (intersection) for sanitization.
+"""
+
+from typing import Dict, FrozenSet, List, Optional, Set
+
+from frame.sil.instructions import (
+    Assign, Call, Return, Sanitize, SinkKind, TaintKind, TaintSource,
+)
+from frame.sil.procedure import Procedure, Program, ProcSpec
+from frame.sil.types import (
+    ExpBinOp, ExpFieldAccess, ExpIndex, ExpStringConcat, ExpUnOp, ExpVar,
+)
+
+FIXPOINT_DESC = "Go same-file flow: tainted argument from a caller"
+_SRC = "src"
+_RETURN = "$return"
+_PACKAGE_PROC = "go:$package"
+
+Flows = Dict[str, Dict[object, FrozenSet[str]]]
+GuardAt = Dict[int, Dict[str, FrozenSet[str]]]
+
+
+def exp_vars(exp) -> List[str]:
+    """Variable names in an expression, as SILTranslator._get_exp_vars names them."""
+    if isinstance(exp, ExpVar):
+        return [str(exp.var)]
+    if isinstance(exp, ExpBinOp):
+        return exp_vars(exp.left) + exp_vars(exp.right)
+    if isinstance(exp, ExpUnOp):
+        return exp_vars(exp.operand)
+    if isinstance(exp, ExpFieldAccess):
+        return exp_vars(exp.base)
+    if isinstance(exp, ExpIndex):
+        return exp_vars(exp.base) + exp_vars(exp.index)
+    if isinstance(exp, ExpStringConcat):
+        return [v for part in exp.parts for v in exp_vars(part)]
+    return []
+
+
+def _instrs(proc: Procedure):
+    for node in proc.nodes.values():
+        yield from node.instrs
+
+
+def _receiver_of(name: str) -> Optional[str]:
+    if "." not in name or name.startswith("go:"):
+        return None
+    return name.rsplit(".", 1)[0]
+
+
+def _call_inputs(ins: Call, name: str, spec: Optional[ProcSpec]):
+    """(variable, sanitizer kinds added) pairs whose taint reaches the result,
+    mirroring SILTranslator._exec_call."""
+    args = [exp_vars(a) for a, _ in ins.args]
+    recv = _receiver_of(name)
+    if spec is None:
+        out = [(v, frozenset()) for vs in args for v in vs]
+        if recv:
+            out.append((recv, frozenset()))
+        return out
+    extra = frozenset(spec.is_sanitizer or ())
+    out = []
+    if spec.is_sanitizer and args:
+        out += [(v, extra) for v in args[0]]
+    for i in spec.taint_propagates:
+        if i < len(args):
+            out += [(v, extra) for v in args[i]]
+    if spec.propagates_taint() and recv and (spec.taint_from_receiver or "." in name):
+        out.append((recv, extra))
+    return out
+
+
+def _flow(proc: Procedure, program: Program, seeds: Flows, include_fixpoint: bool,
+          guard_at: Optional[GuardAt] = None) -> Flows:
+    """Flow-insensitive flows into each variable. `guard_at` adds, at a Call
+    or return Assign, the kinds the frontend's guard tracker had sanitized an
+    input variable for there (they hold on every path to that instruction)."""
+    flows: Flows = {v: dict(ls) for v, ls in seeds.items()}
+    guard_at = guard_at or {}
+    instrs = list(_instrs(proc))
+
+    def add(var: str, label, kinds: FrozenSet[str]) -> bool:
+        cur = flows.setdefault(var, {})
+        if label not in cur:
+            cur[label] = kinds
+            return True
+        narrowed = cur[label] & kinds
+        if narrowed != cur[label]:
+            cur[label] = narrowed
+            return True
+        return False
+
+    changed = True
+    while changed:
+        changed = False
+        for ins in instrs:
+            if isinstance(ins, TaintSource):
+                if include_fixpoint or ins.description != FIXPOINT_DESC:
+                    changed |= add(str(ins.var), _SRC, frozenset())
+            elif isinstance(ins, Assign):
+                target = str(ins.id)
+                guarded = guard_at.get(id(ins), {})
+                for u in exp_vars(ins.exp):
+                    for label, kinds in list(flows.get(u, {}).items()):
+                        changed |= add(target, label, kinds | guarded.get(u, frozenset()))
+            elif isinstance(ins, Call) and ins.ret is not None:
+                ret = str(ins.ret[0])
+                name = ins.get_full_name()
+                spec = program.get_spec(name)
+                guarded = guard_at.get(id(ins), {})
+                for u, extra in _call_inputs(ins, name, spec):
+                    for label, kinds in list(flows.get(u, {}).items()):
+                        changed |= add(ret, label, kinds | extra | guarded.get(u, frozenset()))
+                if spec is not None and spec.is_source:
+                    changed |= add(ret, _SRC, frozenset())
+            elif isinstance(ins, Return) and ins.value is not None:
+                for u in exp_vars(ins.value):
+                    for label, kinds in list(flows.get(u, {}).items()):
+                        changed |= add(_RETURN, label, kinds)
+    return flows
+
+
+def _sccs(graph: Dict[str, Set[str]]) -> List[List[str]]:
+    """Tarjan, iterative. Components come out callees-first."""
+    index: Dict[str, int] = {}
+    low: Dict[str, int] = {}
+    on_stack: Set[str] = set()
+    stack: List[str] = []
+    out: List[List[str]] = []
+    counter = 0
+    for root in graph:
+        if root in index:
+            continue
+        index[root] = low[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        work = [(root, iter(sorted(graph[root])))]
+        while work:
+            v, it = work[-1]
+            nxt = next(it, None)
+            if nxt is not None:
+                if nxt not in index:
+                    index[nxt] = low[nxt] = counter
+                    counter += 1
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    work.append((nxt, iter(sorted(graph[nxt]))))
+                elif nxt in on_stack:
+                    low[v] = min(low[v], index[nxt])
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[v])
+            if low[v] == index[v]:
+                comp = []
+                while True:
+                    w = stack.pop()
+                    on_stack.discard(w)
+                    comp.append(w)
+                    if w == v:
+                        break
+                out.append(comp)
+    return out
+
+
+def _has_own_source(proc: Procedure) -> bool:
+    return any(isinstance(i, TaintSource) and i.description != FIXPOINT_DESC
+               for i in _instrs(proc))
+
+
+def _summarize(proc: Procedure, program: Program, conservative: bool,
+               guard_at: Optional[GuardAt] = None, variadic_arity: int = 0) -> None:
+    """`variadic_arity` > 0 for a variadic procedure: the most arguments any
+    same-file site passes, so arguments folded into the last parameter
+    propagate whenever it does (every site shares this spec object)."""
+    spec = proc.spec
+    offset = 1 if proc.is_method else 0
+    n_args = max(0, len(proc.params) - offset)
+    spec.description = f"Go same-file summary of {proc.name}"
+    _summarize_flows(proc, program, conservative, guard_at, spec, offset, n_args)
+    last = n_args - 1
+    if variadic_arity > n_args and last in spec.taint_propagates:
+        spec.taint_propagates = sorted(set(spec.taint_propagates) | set(range(n_args, variadic_arity)))
+
+
+def _summarize_flows(proc: Procedure, program: Program, conservative: bool,
+                     guard_at: Optional[GuardAt], spec: ProcSpec, offset: int, n_args: int) -> None:
+    if conservative:
+        spec.taint_propagates = list(range(n_args))
+        spec.taint_from_receiver = proc.is_method
+        spec.is_sanitizer = []
+        spec.is_source = "user" if _has_own_source(proc) else None
+        return
+    seeds: Flows = {p.name: {("p", i): frozenset()} for i, (p, _) in enumerate(proc.params)}
+    ret = _flow(proc, program, seeds, include_fixpoint=False, guard_at=guard_at).get(_RETURN, {})
+    params = sorted(label[1] for label in ret if isinstance(label, tuple))
+    spec.taint_propagates = [i - offset for i in params if i >= offset]
+    spec.taint_from_receiver = proc.is_method and 0 in params
+    spec.is_source = "user" if _SRC in ret else None
+    kinds = None
+    for k in ret.values():
+        kinds = set(k) if kinds is None else kinds & k
+    # SILTranslator treats a sanitizer spec as "argument 0 flows to the result",
+    # so a sanitizer summary on a helper whose argument 0 does not reach a return
+    # would invent that flow. Only claim sanitization when argument 0 propagates.
+    spec.is_sanitizer = sorted(kinds) if kinds and 0 in spec.taint_propagates else []
+
+
+def _sink_kinds(kinds: FrozenSet[str]) -> List[SinkKind]:
+    out = []
+    for k in sorted(kinds):
+        try:
+            out.append(SinkKind(k))
+        except ValueError:
+            continue
+    return out
+
+
+def _insert_mark(proc: Procedure, idx: int, kinds: FrozenSet[str]) -> None:
+    """TaintSource for parameter idx at entry, then a Sanitize for the kinds
+    every tainted call site had already sanitized the argument for."""
+    pvar = proc.params[idx][0]
+    entry = proc.nodes[proc.entry_node]
+    if any(isinstance(i, TaintSource) and i.var == pvar for i in entry.instrs):
+        return
+    new = [TaintSource(loc=proc.loc, var=pvar, kind=TaintKind.USER_INPUT,
+                       description=FIXPOINT_DESC)]
+    sanitizes = _sink_kinds(kinds)
+    if sanitizes:
+        new.append(Sanitize(loc=proc.loc, var=pvar, sanitizes=sanitizes,
+                            description=FIXPOINT_DESC))
+    entry.instrs[0:0] = new
+
+
+def _site_kinds(flows: Flows, var_names: List[str],
+                guarded: Optional[Dict[str, FrozenSet[str]]] = None) -> Optional[FrozenSet[str]]:
+    """Kinds sanitized on every source flow into these variables (plus the
+    guard kinds holding for each variable at the site); None if untainted."""
+    kinds: Optional[FrozenSet[str]] = None
+    guarded = guarded or {}
+    for v in var_names:
+        k = flows.get(v, {}).get(_SRC)
+        if k is not None:
+            k = k | guarded.get(v, frozenset())
+            kinds = k if kinds is None else kinds & k
+    return kinds
+
+
+def apply_same_file_flow(program: Program, site_callees: Dict[str, str],
+                         guard_at: Optional[GuardAt] = None,
+                         variadic: Optional[Set[str]] = None) -> None:
+    guard_at = guard_at or {}
+    procs = {n: p for n, p in program.procedures.items() if n != _PACKAGE_PROC}
+    # 1. Every site that resolves to a same-file procedure shares its spec object.
+    for site, callee in site_callees.items():
+        if callee in procs and site != callee:
+            program.library_specs[site] = procs[callee].spec
+    # 2. Summaries, callees first.
+    graph: Dict[str, Set[str]] = {n: set() for n in procs}
+    for n, p in procs.items():
+        for ins in _instrs(p):
+            if isinstance(ins, Call):
+                callee = site_callees.get(ins.get_full_name())
+                if callee in procs:
+                    graph[n].add(callee)
+    variadic = variadic or set()
+    arity: Dict[str, int] = {}
+    for p in procs.values():
+        for ins in _instrs(p):
+            if isinstance(ins, Call):
+                callee = site_callees.get(ins.get_full_name())
+                if callee in variadic:
+                    arity[callee] = max(arity.get(callee, 0), len(ins.args))
+    for comp in _sccs(graph):
+        recursive = len(comp) > 1 or any(n in graph[n] for n in comp)
+        for n in comp:
+            _summarize(procs[n], program, conservative=recursive, guard_at=guard_at,
+                       variadic_arity=arity.get(n, 0))
+    # 3. Into callees, to a fixpoint. marks[(callee, param index)] holds the
+    # sink kinds sanitized on EVERY tainted flow into that parameter, over all
+    # call sites. Marks are only added or narrowed, so the loop terminates.
+    marks: Dict[tuple, FrozenSet[str]] = {}
+    changed = True
+    while changed:
+        changed = False
+        for pname, proc in procs.items():
+            seeds: Flows = {proc.params[i][0].name: {_SRC: k}
+                            for (c, i), k in marks.items() if c == pname}
+            flows = _flow(proc, program, seeds, include_fixpoint=False, guard_at=guard_at)
+            for ins in _instrs(proc):
+                if not isinstance(ins, Call):
+                    continue
+                cname = site_callees.get(ins.get_full_name(), "")
+                callee = procs.get(cname)
+                if callee is None:
+                    continue
+                offset = 1 if callee.is_method else 0
+                guarded = guard_at.get(id(ins), {})
+                last = len(callee.params) - 1
+                hits: Dict[int, Optional[FrozenSet[str]]] = {}
+                for j, (a, _) in enumerate(ins.args):
+                    idx = j + offset
+                    kinds = _site_kinds(flows, exp_vars(a), guarded)
+                    if cname in variadic and idx > last:
+                        # Arguments past the last parameter are elements of
+                        # the variadic slice: fold them into it, keeping only
+                        # kinds every tainted one is sanitized for.
+                        idx = last
+                    if idx in hits and hits[idx] is not None:
+                        kinds = hits[idx] if kinds is None else hits[idx] & kinds
+                    hits[idx] = kinds
+                if callee.is_method:
+                    recv = _receiver_of(ins.get_full_name())
+                    hits[0] = _site_kinds(flows, [recv] if recv else [], guarded)
+                for idx, kinds in hits.items():
+                    if kinds is None or idx >= len(callee.params):
+                        continue
+                    key = (cname, idx)
+                    old = marks.get(key)
+                    new = kinds if old is None else old & kinds
+                    if new != old:
+                        marks[key] = new
+                        changed = True
+    for (cname, idx), kinds in sorted(marks.items()):
+        _insert_mark(procs[cname], idx, kinds)
