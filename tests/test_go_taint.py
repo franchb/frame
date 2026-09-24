@@ -1419,3 +1419,51 @@ func NewCallback(sc *cookies.Handler) http.Handler {
     assert "CWE-601" in _cwes('''package main
 import "github.com/gin-gonic/gin"
 func h(c *gin.Context) { c.Redirect(302, nextFrom(c)) }''')
+
+
+# --- Fix round 1: bulk request data handed to the unresolved call.
+
+def test_destination_from_call_taking_bulk_request_data_still_fires():
+    # An OAuth callback parser handed the whole query / cookies / URL: its
+    # result is request data (an open redirect through `ReturnTo`).
+    extra = ("type Flow interface{ HandleCallback(interface{}) State; Begin(interface{}, string) State }\n"
+             "type State struct{ ReturnTo string }\nvar svc Flow")
+    for body in ('st := svc.HandleCallback(r.URL.Query())',
+                 'st := svc.HandleCallback(r.Cookies())',
+                 'q := r.URL.Query()\nst := svc.HandleCallback(q)',
+                 'u := r.URL\nst := svc.HandleCallback(u)',
+                 'ck, _ := r.Cookie("flow")\nst := svc.HandleCallback(ck)',
+                 'st := svc.HandleCallback(Params{Req: r})',
+                 'st := svc.HandleCallback(&Params{Req: r, Tags: []string{"a"}})',
+                 'st := callbackState(r.URL.Query())'):
+        src = _handler(body + '\nhttp.Redirect(w, r, st.ReturnTo, 302)', RD,
+                       extra + "\ntype Params struct{ Req *http.Request; Tags []string }")
+        assert "CWE-601" in _cwes(src), body
+    # The request context is not request data; one value read from the
+    # request only selects what the service returns.
+    for body in ('st := svc.Begin(r.Context(), r.URL.Query().Get("idp"))',
+                 'st := svc.Begin(r.Context(), r.FormValue("idp"))'):
+        src = _handler(body + '\nhttp.Redirect(w, r, st.ReturnTo, 302)', RD, extra)
+        _pair("CWE-601", src.replace("st.ReturnTo", 'r.FormValue("next")'), src)
+
+
+def test_captured_local_of_enclosing_function_is_not_a_service():
+    from frame.sil.frontends.go_frontend import GoFrontend
+    src = '''package main
+import "net/http"
+type Svc interface{ Next(string) string }
+type local struct{}
+func Outer(p Svc) http.Handler {
+	l := local{}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a := p.Next(r.FormValue("a"))
+		b := l.Next(r.FormValue("b"))
+		_, _ = a, b
+	})
+}
+'''
+    fe = GoFrontend()
+    fe.translate(src, "t.go")
+    raw = src.encode()
+    marked = {raw[s:e].decode() for s, e in fe._unresolved_method_calls}
+    assert marked == {'p.Next(r.FormValue("a"))'}, marked

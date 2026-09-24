@@ -193,6 +193,9 @@ RESULT_TYPES: Dict[str, str] = {
     "github.com/gin-gonic/gin.New": "github.com/gin-gonic/gin.Engine",
     "github.com/labstack/echo.New": "github.com/labstack/echo.Echo",
     "github.com/labstack/echo.Context.Request": "net/http.Request",
+    "net/http.Request.Cookie": "net/http.Cookie",
+    "net/http.Request.Clone": "net/http.Request",
+    "net/http.Request.WithContext": "net/http.Request",
 }
 for _m in ("Where", "Order", "Group", "Model", "Table", "Raw", "Joins", "Select",
            "Session", "WithContext", "Debug", "Limit", "Offset", "Preload"):
@@ -214,6 +217,12 @@ SERVER_CONTEXT_TYPES: FrozenSet[str] = frozenset({
     "github.com/labstack/echo.Context",
     "github.com/gofiber/fiber.Ctx",
 })
+# Bulk request data: handing one of these to a call the frontend cannot see
+# makes its result request data (go_frontend._is_request_data).
+REQUEST_DATA_TYPES: FrozenSet[str] = frozenset({
+    REQUEST_TYPE, *SERVER_CONTEXT_TYPES, "net/url.URL", "net/url.Values",
+    "net/http.Header", "net/http.Cookie"})
+REQUEST_DATA_CALLS: FrozenSet[str] = frozenset({"net/http.Request.Cookies"})
 LIBRARY_PARAM_TYPES: FrozenSet[str] = frozenset({"string", "[]byte", "io.Reader"})
 HANDLER_REGISTRAR_FUNCS: FrozenSet[str] = frozenset({
     "net/http.HandleFunc", "net/http.Handle", "net/http.HandlerFunc"})

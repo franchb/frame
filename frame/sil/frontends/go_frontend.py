@@ -47,7 +47,7 @@ from frame.sil.specs.go_specs import (
     MAKE_SLICE_SPEC, NON_PROPAGATING_CALLS, NON_PROPAGATING_FIELDS, NORETURN,
     OUT_PARAMS, RECEIVER_MUTATION, REQUEST_TYPE, RESPONSE_WRITER, RESULT_TYPES,
     SERVER_CONTEXT_TYPES, SHELL_COMMAND_KEYS, SHELL_FLAGS, SHELL_NAMES,
-    UNRESOLVED_GUARDED_ARGS,
+    UNRESOLVED_GUARDED_ARGS, REQUEST_DATA_TYPES, REQUEST_DATA_CALLS,
 )
 
 _EMPTY = ProcSpec(description="Go: result carries no taint")
@@ -152,7 +152,7 @@ class GoFrontend:
         # result of an unresolved call (see _unresolved_only).
         self._unresolved_defs: Set[str] = set()
         # (start, end) bytes of method calls lowered by default propagation
-        # on a service-like receiver (see _unresolved_method).
+        # on a service-like receiver (see _lower_method_call, _service_receiver).
         self._unresolved_method_calls: Set[Tuple[int, int]] = set()
         self._emitting_defers = False
         old_limit = sys.getrecursionlimit()
@@ -1338,20 +1338,56 @@ class GoFrontend:
                 and not self._passes_request(self._arg_nodes(node)))
 
     def _passes_request(self, arg_nodes) -> bool:
-        """Does an argument hand over the request object itself (`r`, `&r`,
-        `r.Header`, `c` for a server context) rather than a value read from it?
-        A call that takes the request is an accessor in disguise (a cookie or
-        session reader, a binder): its result is request data."""
-        for arg in arg_nodes:
-            node = arg
-            while node is not None and node.type in ("parenthesized_expression",
-                                                     "unary_expression", "selector_expression"):
-                node = (node.child_by_field_name("operand") if node.type != "parenthesized_expression"
-                        else (node.named_children[0] if node.named_children else None))
-            if node is not None and node.type == "identifier":
-                typ = self._scope_lookup(self._t(node))
-                if typ is not None and (typ.path == REQUEST_TYPE or typ.path in SERVER_CONTEXT_TYPES):
-                    return True
+        """Does an argument hand over the request, or bulk data of it, rather
+        than one value read from it? A call that takes the request is an
+        accessor in disguise (a cookie or session reader, a binder, a callback
+        parser): its result is request data."""
+        return any(self._is_request_data(a) for a in arg_nodes)
+
+    def _is_request_data(self, node) -> bool:
+        """The request / server context itself or a field of it (`r`, `&r`,
+        `*r`, `r.Header`, `r.Body`, `c`); a value of a bulk request-data type
+        (`r.URL`, `r.URL.Query()`, `q := r.URL.Query()`, a cookie); the result
+        of `r.Cookies()`; or a composite literal carrying any of them
+        (`Params{Req: r}`). Not a scalar accessor result (`r.FormValue(k)`,
+        `q.Get(k)`) and not `r.Context()`."""
+        while node is not None and node.type in ("parenthesized_expression", "unary_expression"):
+            node = (node.child_by_field_name("operand") if node.type == "unary_expression"
+                    else (node.named_children[0] if node.named_children else None))
+        if node is None:
+            return False
+        if node.type == "composite_literal":
+            stack = [node.child_by_field_name("body")]
+            while stack:
+                lit = stack.pop()
+                for c in (lit.named_children if lit is not None else []):
+                    if c.type in ("keyed_element", "literal_element"):
+                        val = c.named_children[-1] if c.named_children else None
+                        if val is not None and val.type == "literal_element" and val.named_children:
+                            val = val.named_children[0]
+                        if val is None:
+                            continue
+                        if val.type == "literal_value":
+                            stack.append(val)
+                        elif self._is_request_data(val):
+                            return True
+                    elif c.type == "literal_value":
+                        stack.append(c)
+                    elif c.type != "comment" and self._is_request_data(c):
+                        return True
+            return False
+        if self._type_of(node).path in REQUEST_DATA_TYPES:
+            return True
+        if node.type == "call_expression":
+            return self._call_key(node) in REQUEST_DATA_CALLS
+        root = node
+        while root is not None and root.type in ("selector_expression", "index_expression",
+                                                 "parenthesized_expression"):
+            root = (root.child_by_field_name("operand") if root.type != "parenthesized_expression"
+                    else (root.named_children[0] if root.named_children else None))
+        if root is not None and root.type == "identifier":
+            typ = self._scope_lookup(self._t(root))
+            return typ is not None and (typ.path == REQUEST_TYPE or typ.path in SERVER_CONTEXT_TYPES)
         return False
 
     def _unresolved_only(self, node) -> bool:
@@ -1413,8 +1449,16 @@ class GoFrontend:
             if name in scope.names:
                 return False                                # a local of this body
             scope = scope.parent
-        return not (scope is not None and name in scope.names
-                    and name in (getattr(self, "_result_vars", None) or ()))
+        if scope is not None and name in scope.names:
+            return name not in (getattr(self, "_result_vars", None) or ())
+        # Captured from an enclosing function: only its parameters and
+        # receiver, not a local it assigns. Not found at all: package state.
+        scope = scope.parent if scope is not None else None
+        while scope is not None:
+            if name in scope.names:
+                return scope.proc_root
+            scope = scope.parent
+        return True
 
     def _call_key(self, node) -> Optional[str]:
         """The canonical key of a call node (package function or typed method),

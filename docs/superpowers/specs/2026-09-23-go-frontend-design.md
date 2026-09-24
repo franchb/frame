@@ -428,11 +428,16 @@ There are two kinds of unresolved call:
   this file. The receiver's type must be unknown, declared in this package, or
   imported from a package that no spec models. That excludes the standard
   library and the modelled frameworks, whose unmodelled methods remain
-  library behaviour. The receiver must also be unresolved-only itself, or be
-  rooted at a parameter, the method receiver, a variable captured from an
-  enclosing function, or a package-level variable. A local assigned in the
-  current body does not qualify, and neither does a named result or a request
-  / server-context value.
+  library behaviour. "Standard library" means an import path whose first
+  segment has no dot. A module named without a dot (`module myapp`) therefore
+  counts as standard library, and this rule does not apply to its packages.
+  That errs toward firing.
+
+  The receiver must also be unresolved-only itself, or be rooted at one of:
+  a parameter, the method receiver, a parameter or receiver captured from an
+  enclosing function, or a package-level variable. These do not qualify: a
+  local assigned in the current body or in an enclosing function, a named
+  result, and a request / server-context value.
 
   The usual shape is an interface or other-package service that a handler
   passes a request value to. For example, an auth start handler runs
@@ -443,11 +448,23 @@ There are two kinds of unresolved call:
   `f := form{Next: r.FormValue("n")}; http.Redirect(w, r, f.Target(), 302)`
   keeps firing when `Target` lives in another file.
 
-Neither kind counts when an argument hands over the request object itself
-(`r`, `&r`, `r.Header`, a gin / echo `c`) rather than a value read from it.
-Such a call is an accessor in disguise, for example a cookie or session
-reader or a binder, so its result is request data:
-`to, _ := sc.Cookie(r, "to"); http.Redirect(w, r, to, 302)` keeps firing.
+Neither kind counts when an argument hands over the request or bulk data of
+it, rather than one value read from it. Such an argument is any of:
+
+- the request or server context, or a field of it: `r`, `&r`, `*r`,
+  `r.Header`, `r.Body`, a gin / echo `c`;
+- a value of a bulk request-data type (`REQUEST_DATA_TYPES`), whether passed
+  inline or through a variable: `r.URL`, `r.URL.Query()`,
+  `q := r.URL.Query()`, a cookie from `r.Cookie`;
+- the result of `r.Cookies()`;
+- a composite literal that carries any of these: `Params{Req: r}`.
+
+Such a call is an accessor in disguise: a cookie or session reader, a binder,
+or an OAuth callback parser. Its result is request data, so both
+`to, _ := sc.Cookie(r, "to"); http.Redirect(w, r, to, 302)` and
+`st := svc.HandleCallback(r.URL.Query()); http.Redirect(w, r, st.ReturnTo, 302)`
+keep firing. A scalar accessor result (`r.FormValue(k)`, `q.Get(k)`) and
+`r.Context()` are not bulk data.
 Request accessors (`r.FormValue`, `r.URL.Query().Get`, `c.Query`) resolve
 through the known source types and specs, so they are never unresolved.
 Default unknown-call propagation still taints the results for every other
